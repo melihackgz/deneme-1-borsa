@@ -21,7 +21,6 @@ try:
 except Exception:
     pass
 
-# Brüt takas / tedbirli sığ hisseler (arka planda otomatik elenir)
 DEFAULT_BANNED = {"DIRIT", "CASA", "COSMO", "EKIZ", "ETILR", "KUVVA", "MARKA", "MMCAS", "ROYAL", "SELGD", "UFUK", "UMPAS"}
 
 # Profil: (min RVOL, değişim alt, üst, RSI alt, üst, min günlük hacim M TL, min günlük hareket %)
@@ -34,11 +33,11 @@ PROFILES = {
 st.set_page_config(page_title="BIST Kolay Tarayıcı", page_icon="📈", layout="wide")
 st.markdown("""<style>
 #MainMenu,footer{visibility:hidden}
-.block-container{max-width:960px;padding-top:1.2rem}
+.block-container{max-width:980px;padding-top:1.2rem}
 .hdr{background:linear-gradient(135deg,#0f172a,#1e3a8a);color:#fff;padding:20px 24px;border-radius:16px;margin-bottom:14px}
 .hdr h1{margin:0;font-size:1.55rem;color:#fff;padding:0}
 .hdr p{margin:6px 0 0;opacity:.85;font-size:.9rem}
-.card{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:18px 20px;margin:14px 0 6px;background:rgba(128,128,128,.05)}
+.card{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:18px 20px;margin:14px 0 8px;background:rgba(128,128,128,.05)}
 .top{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .tk{font-size:1.6rem;font-weight:800;letter-spacing:.5px}
 .sub{opacity:.75;font-size:.85rem;margin-top:2px}
@@ -50,7 +49,7 @@ st.markdown("""<style>
 .box small{opacity:.75;display:block;font-size:.74rem;margin-bottom:2px}
 .box b{font-size:1.08rem}
 .bar{display:flex;align-items:center;gap:8px;font-size:.8rem;margin:6px 0}
-.bar span{width:110px;opacity:.85}
+.bar span{width:120px;opacity:.85}
 .track{flex:1;height:8px;border-radius:6px;background:rgba(128,128,128,.25);overflow:hidden}
 .fill{height:100%;border-radius:6px}
 .bar b{width:32px;text-align:right}
@@ -98,6 +97,11 @@ def update_trade_status(trade_id, status, exit_price=None):
         if row and exit_price is not None and exit_price > 0:
             pnl = round((exit_price - row[0]) * row[1], 2)
         conn.execute("UPDATE trades SET status = ?, exit_price = ?, pnl = ? WHERE id = ?", (status, exit_price, pnl, trade_id))
+
+
+def delete_trade(trade_id):
+    with sqlite3.connect(DB_PATH) as conn:
+        conn.execute("DELETE FROM trades WHERE id = ?", (trade_id,))
 
 
 init_db()
@@ -246,6 +250,26 @@ def get_fund(tickers):
         return dict(ex.map(one, tickers[:40]))
 
 
+def get_single_stock_data(ticker):
+    """Manuel aranan tek hisse için hem günlük hem 15dk veri ve bilanço getirir."""
+    t = ticker.strip().upper().replace(".IS", "")
+    try:
+        d1d = yf.download(t + ".IS", period="1y", interval="1d", progress=False, auto_adjust=False).dropna(subset=["Close"])
+        d15 = yf.download(t + ".IS", period="5d", interval="15m", progress=False, auto_adjust=False).dropna(subset=["Close"])
+        if isinstance(d1d.columns, pd.MultiIndex):
+            d1d.columns = d1d.columns.get_level_values(0)
+        if isinstance(d15.columns, pd.MultiIndex):
+            d15.columns = d15.columns.get_level_values(0)
+        if not d1d.empty:
+            d1d.index = d1d.index.tz_localize("UTC").tz_convert(TZ) if d1d.index.tz is None else d1d.index.tz_convert(TZ)
+        if not d15.empty:
+            d15.index = d15.index.tz_localize("UTC").tz_convert(TZ) if d15.index.tz is None else d15.index.tz_convert(TZ)
+        info = yf.Ticker(t + ".IS").info or {}
+        return t, d1d, d15, info
+    except Exception:
+        return t, pd.DataFrame(), pd.DataFrame(), {}
+
+
 def check_market_regime(d15, d1d):
     info = {"ok": True, "chg": 0.0, "msg": "Borsa genel durumu normal görünüyor."}
     if d1d.empty or len(d1d) < 20:
@@ -315,6 +339,69 @@ def check_wick_health(row):
     return wick_ratio <= 0.45, wick_ratio * 100
 
 
+def compute_smart_plan(entry, raw_support, daily_atr, capital, risk_pct, temel_puan, tek_puan, is_swing):
+    """
+    Tekniğe VE Temele dayalı dinamik Stop, Hedef ve Adet (Lot) hesaplayıcı.
+    - Teknik: Destek seviyesi (EMA20 / VWAP / Gün dibi) + ATR oynaklık payı.
+    - Temel: Bilanço sağlamsa (Temel >= 65) hisseye biraz daha nefes payı ve daha yüksek hedef çarpanı tanır;
+             bilanço zayıfsa (< 45) stopu sıkılaştırır, hedefi daha temkinli (kısa) tutar.
+    """
+    # Temel bazlı çarpanlar
+    if is_swing and temel_puan is not None:
+        if temel_puan >= 65:
+            atr_buffer = 0.65       # Güçlü şirkette sahte silkelemeye yakalanmamak için biraz daha geniş nefes payı
+            rr1, rr2 = 2.2, 3.8     # Güçlü bilanço trendi daha uzağa taşır
+            plan_note = f"Bilanço güçlü ({temel_puan}/100): Silkelemelere karşı destek payı korundu, hedefler genişletildi."
+        elif temel_puan >= 45:
+            atr_buffer = 0.50
+            rr1, rr2 = 1.8, 3.0
+            plan_note = f"Bilanço orta ({temel_puan}/100): Standart teknik destek ve kâr hedefleri uygulandı."
+        else:
+            atr_buffer = 0.35       # Zayıf bilançoda kârı erken al, stopu yakın tut
+            rr1, rr2 = 1.4, 2.2
+            plan_note = f"Bilanço zayıf ({temel_puan}/100): Riski sınırlamak için stop sıkılaştırıldı, hedefler yakın tutuldu."
+    else:
+        # Gün içi veya temel veri yoksa saf teknik + momentum gücü
+        atr_buffer = 0.30 if not is_swing else 0.50
+        rr1 = 1.6 if tek_puan >= 80 else 1.4
+        rr2 = 2.6 if tek_puan >= 80 else 2.2
+        plan_note = "Teknik destek (EMA/VWAP) ve günlük oynaklık (ATR) baz alınarak hesaplandı."
+
+    stop = raw_support - atr_buffer * daily_atr
+    # Stop hiçbir zaman giriş fiyatının üstünde veya aşırı yakın olamaz
+    min_stop_dist = 0.35 * daily_atr
+    if (entry - stop) < min_stop_dist:
+        stop = entry - min_stop_dist
+
+    # Stop maksimum sınırı (Aşırı geniş stopları kırp ki 'Takibe Al' tuşu her zaman çalışsın, risk kontrol altında kalsın)
+    max_stop_dist = (1.8 * daily_atr) if is_swing else (0.9 * daily_atr)
+    is_wide_warning = False
+    if (entry - stop) > max_stop_dist:
+        is_wide_warning = True
+        stop = entry - max_stop_dist
+
+    risk = max(entry - stop, 0.01)
+    target1 = entry + rr1 * risk
+    target2 = entry + rr2 * risk
+
+    # Risk yönetimine göre ideal adet (lot) hesabı (en az 1 adet)
+    max_tl_risk = capital * (risk_pct / 100.0)
+    raw_lot = min(max_tl_risk / risk, (capital * 0.40) / entry)
+    lot = max(1, int(raw_lot))
+
+    return {
+        "stop": round(stop, 2),
+        "risk": risk,
+        "target1": round(target1, 2),
+        "target2": round(target2, 2),
+        "lot": lot,
+        "is_wide": is_wide_warning,
+        "plan_note": plan_note,
+        "rr1": rr1,
+        "rr2": rr2
+    }
+
+
 def analyze_intraday(t, d, p, daily_atr):
     d = d.copy()
     d["day"] = d.index.date
@@ -337,8 +424,8 @@ def analyze_intraday(t, d, p, daily_atr):
     wick_ok, _ = check_wick_health(r)
 
     checks = [
-        ("Fiyat gün içi ortalamanın üzerinde güçlü duruyor", bool(r["Close"] > r["vwap"])),
-        ("Kısa vadeli yükseliş trendi aktif", bool(r["ema9"] > r["ema20"] and r["Close"] > r["ema20"])),
+        ("Fiyat gün içi ortalamanın (VWAP) üzerinde güçlü duruyor", bool(r["Close"] > r["vwap"])),
+        ("Kısa vadeli yükseliş trendi aktif (EMA9 > EMA20)", bool(r["ema9"] > r["ema20"] and r["Close"] > r["ema20"])),
         (f"Fiyat henüz aşırı şişmemiş (Bugün %{chg:+.1f})", bool(p["chg_lo"] <= chg <= p["chg_hi"])),
         ("Alım iştahı dengeli (Aşırı alım bölgesinde değil)", bool(p["rsi_lo"] <= r["rsi"] <= p["rsi_hi"])),
         ("Hisseye normalin üzerinde işlem hacmi giriyor", bool(rvol >= p["rvol"])),
@@ -346,24 +433,23 @@ def analyze_intraday(t, d, p, daily_atr):
     ]
 
     entry = float(r["Close"])
-    support_level = max(min(float(r["vwap"]), float(r["ema20"])), float(today["Low"].min()))
-    stop = support_level - 0.25 * float(r["atr"])
-    if stop >= entry:
-        stop = entry - 0.5 * daily_atr
+    raw_support = max(min(float(r["vwap"]), float(r["ema20"])), float(today["Low"].min()))
+    puan = sum(ok for _, ok in checks)
+    toplam = len(checks)
+    tek = puan / toplam * 100
 
-    risk = entry - stop
-    stop_ok = 0 < risk <= 0.65 * daily_atr
-    lot = int(min(p["capital"] * p["risk_pct"] / 100 / risk, p["capital"] * 0.4 / entry)) if risk > 0 else 0
+    plan = compute_smart_plan(entry, raw_support, daily_atr, p["capital"], p["risk_pct"], None, tek, is_swing=False)
 
     return {
         "Hisse": t, "Fiyat": entry, "Değişim": chg, "Kontroller": checks,
-        "Puan": sum(ok for _, ok in checks), "Toplam": len(checks),
-        "Stop": stop, "Risk": risk, "Hedef1": entry + 1.5 * risk, "Hedef2": entry + 2.5 * risk,
-        "Lot": lot, "Stop uygun": stop_ok, "_ts": d.index[-1], "RVOL": rvol
+        "Puan": puan, "Toplam": toplam, "Tek": tek,
+        "Stop": plan["stop"], "Risk": plan["risk"], "Hedef1": plan["target1"], "Hedef2": plan["target2"],
+        "Lot": plan["lot"], "IsWide": plan["is_wide"], "PlanNote": plan["plan_note"],
+        "_ts": d.index[-1], "RVOL": rvol
     }
 
 
-def analyze_swing(t, d, p, daily_atr):
+def analyze_swing(t, d, p, daily_atr, temel_puan=None):
     if len(d) < 55:
         return None
     d = d.copy()
@@ -379,26 +465,29 @@ def analyze_swing(t, d, p, daily_atr):
     wick_ok, _ = check_wick_health(r)
 
     checks = [
-        ("Orta ve uzun vadeli trend yukarı yönlü", bool(r["Close"] > r["ema20"] > r["ema50"])),
-        ("Yükseliş gücü sağlıklı ve dengeli", bool(50 <= r["rsi"] <= 68)),
+        ("Orta ve uzun vadeli trend yukarı yönlü (Fiyat > EMA20 > EMA50)", bool(r["Close"] > r["ema20"] > r["ema50"])),
+        (f"Yükseliş gücü sağlıklı ve dengeli (RSI {r['rsi']:.0f})", bool(50 <= r["rsi"] <= 68)),
         ("Alıcı hacmi ortalamanın üzerinde", bool(rvol >= 1.1)),
         (f"Fiyat henüz tavan/aşırı prim yapmamış (%{chg:+.1f})", bool(-1.0 <= chg <= 6.5)),
         ("Gün sonu kapanışı güçlü, satış baskısı yok", wick_ok),
     ]
 
     entry = float(r["Close"])
-    stop = float(r["ema20"]) - 0.5 * daily_atr
-    if stop >= entry:
-        stop = entry - 1.0 * daily_atr
-    risk = entry - stop
-    stop_ok = 0 < risk <= 1.8 * daily_atr
-    lot = int(min(p["capital"] * p["risk_pct"] / 100 / risk, p["capital"] * 0.4 / entry)) if risk > 0 else 0
+    # Teknik destek: EMA20 veya son 5 günün en düşük seviyesi (hangisi fiyata daha yakınsa)
+    recent_low = float(d["Low"].tail(5).min())
+    raw_support = max(float(r["ema20"]), recent_low)
+    puan = sum(ok for _, ok in checks)
+    toplam = len(checks)
+    tek = puan / toplam * 100
+
+    plan = compute_smart_plan(entry, raw_support, daily_atr, p["capital"], p["risk_pct"], temel_puan, tek, is_swing=True)
 
     return {
         "Hisse": t, "Fiyat": entry, "Değişim": chg, "Kontroller": checks,
-        "Puan": sum(ok for _, ok in checks), "Toplam": len(checks),
-        "Stop": stop, "Risk": risk, "Hedef1": entry + 2.0 * risk, "Hedef2": entry + 3.5 * risk,
-        "Lot": lot, "Stop uygun": stop_ok, "_ts": d.index[-1], "RVOL": rvol
+        "Puan": puan, "Toplam": toplam, "Tek": tek,
+        "Stop": plan["stop"], "Risk": plan["risk"], "Hedef1": plan["target1"], "Hedef2": plan["target2"],
+        "Lot": plan["lot"], "IsWide": plan["is_wide"], "PlanNote": plan["plan_note"],
+        "_ts": d.index[-1], "RVOL": rvol
     }
 
 
@@ -491,16 +580,18 @@ def bar(label, v):
 
 
 def build_plain_reason(r, is_swing):
-    """Hiç bilmeyen biri için sade Türkçe özet cümlesi."""
-    parts = [f"Hisse bugün <b>%{r['Değişim']:+.1f}</b> hareketle güçlü bir yükseliş trendinde"]
-    if r["Para"] >= 66:
-        parts.append("hisseye belirgin bir <b>para girişi</b> gözleniyor")
-    if is_swing and r["Temel"] is not None and r["Temel"] >= 60:
-        parts.append("şirketin <b>bilanço ve kârlılık verileri sağlam</b>")
-    return "💡 <b>Neden Listede?</b> " + ", ".join(parts) + "."
+    parts = [f"Hisse bugün <b>%{r['Değişim']:+.1f}</b> hareketle yükseliş eğiliminde"]
+    if r.get("Para", 0) >= 66:
+        parts.append("hisseye belirgin bir <b>para girişi</b> var")
+    if is_swing and r.get("Temel") is not None:
+        if r["Temel"] >= 60:
+            parts.append("şirketin <b>bilanço ve kârlılık verileri sağlam</b>")
+        elif r["Temel"] < 45:
+            parts.append("<b>bilanço verileri zayıf</b> olduğu için temkinli hedef belirlendi")
+    return "💡 <b>Durum Özeti:</b> " + ", ".join(parts) + "."
 
 
-def card(r, info, frows, mode_name):
+def card(r, info, frows, mode_name, key_prefix="opp"):
     label, col = verdict(r["Genel"])
     is_swing = "Birkaç Günlük" in mode_name
     sector = info.get("sector") or info.get("industry") or ("Gün İçi Fırsat" if not is_swing else "Orta Vadeli Trend")
@@ -508,39 +599,44 @@ def card(r, info, frows, mode_name):
     html = (f'<div class="card"><div class="top"><div><div class="tk">{r["Hisse"]}</div>'
             f'<div class="sub">{sector} • Güncel Fiyat: <b>{tl(r["Fiyat"])} TL</b> (Bugün %{r["Değişim"]:+.1f})</div></div>'
             f'<div class="pill" style="background:{col}">{label} • {r["Genel"]:.0f}/100</div></div>'
-            f'<div class="summary-box">{build_plain_reason(r, is_swing)}</div>')
+            f'<div class="summary-box">{build_plain_reason(r, is_swing)}<br><small style="opacity:.8">📐 <b>Plan Mantığı:</b> {r["PlanNote"]}</small></div>')
 
-    if r["Stop uygun"] and r["Lot"] >= 1:
-        html += ('<div class="grid">'
-                 f'<div class="box"><small>1. Alış Fiyatı</small><b>{tl(r["Fiyat"])} TL</b></div>'
-                 f'<div class="box"><small>2. Zarar Kes (Stop)</small><b>{tl(r["Stop"])} TL</b></div>'
-                 f'<div class="box"><small>3. İlk Kâr Hedefi</small><b>{tl(r["Hedef1"])} TL</b></div>'
-                 f'<div class="box"><small>4. İkinci Kâr Hedefi</small><b>{tl(r["Hedef2"])} TL</b></div></div>')
+    html += ('<div class="grid">'
+             f'<div class="box"><small>1. Alış Fiyatı</small><b>{tl(r["Fiyat"])} TL</b></div>'
+             f'<div class="box"><small>2. Zarar Kes (Stop)</small><b>{tl(r["Stop"])} TL</b></div>'
+             f'<div class="box"><small>3. İlk Kâr Hedefi</small><b>{tl(r["Hedef1"])} TL</b></div>'
+             f'<div class="box"><small>4. İkinci Kâr Hedefi</small><b>{tl(r["Hedef2"])} TL</b></div></div>')
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
-    c_info, c_btn = st.columns([4, 1.2])
+    c_info, c_btn = st.columns([3.8, 1.3])
     with c_info:
-        if r["Stop uygun"] and r["Lot"] >= 1:
-            total_cost = r["Lot"] * r["Fiyat"]
-            max_loss = r["Lot"] * r["Risk"]
-            est_gain = r["Lot"] * 1.5 * r["Risk"]
-            st.success(
-                f"📌 **Önerilen Alım:** **{r['Lot']} adet** (Yaklaşık **{tl(total_cost)} TL** tutar) • "
-                f"Ters giderse en fazla **{tl(max_loss)} TL** zarar edersin • "
-                f"1. hedefe ulaşırsa ortalama **{tl(est_gain)} TL** kâr bırakır."
+        total_cost = r["Lot"] * r["Fiyat"]
+        max_loss = r["Lot"] * r["Risk"]
+        est_gain = r["Lot"] * (r["Hedef1"] - r["Fiyat"])
+        if r.get("IsWide"):
+            st.warning(
+                f"⚠️ **Oynaklık Yüksek:** Önerilen **{r['Lot']} adet** (~**{tl(total_cost)} TL**) • "
+                f"Stop kaybı: **{tl(max_loss)} TL** • 1. hedef kârı: **{tl(est_gain)} TL**."
             )
         else:
-            st.warning("⚠️ Bu hissede zarar kes mesafesi bütçe riskine göre fazla geniş. Yeni başlayanlar için uygun değil, pas geçin.")
+            st.success(
+                f"📌 **Önerilen Alım:** **{r['Lot']} adet** (Yaklaşık **{tl(total_cost)} TL**) • "
+                f"Stop olursa kayıp: **{tl(max_loss)} TL** • "
+                f"1. hedefte kâr: **{tl(est_gain)} TL**."
+            )
 
     with c_btn:
-        if r["Stop uygun"] and r["Lot"] >= 1:
-            if st.button("📝 Takibe Al", key=f"log_{mode_name}_{r['Hisse']}", use_container_width=True):
-                add_trade(mode_name, r["Hisse"], r["Fiyat"], r["Stop"], r["Hedef1"], r["Hedef2"], r["Lot"])
-                st.toast(f"{r['Hisse']} 'İşlemlerim' sekmesine eklendi!", icon="✅")
+        # TAKİBE AL TUŞU ARTIK HER KARTTA GARANTİLİ OLARAK GÖRÜNÜR
+        if st.button("📝 Takibe Al", key=f"log_{key_prefix}_{mode_name}_{r['Hisse']}", use_container_width=True, type="primary"):
+            add_trade(mode_name, r["Hisse"], r["Fiyat"], r["Stop"], r["Hedef1"], r["Hedef2"], r["Lot"])
+            st.toast(f"✅ {r['Hisse']} takip listene ('İşlemlerim' sekmesine) eklendi!", icon="📌")
 
     with st.expander(f"🔍 {r['Hisse']} Teknik ve Bilanço Detaylarını Gör"):
-        st.markdown(bar("Grafik Gücü", r["Tek"]) + bar("Para Girişi", r["Para"]) + (bar("Bilanço Sağlamlığı", r["Temel"]) if is_swing and r["Temel"] is not None else ""), unsafe_allow_html=True)
+        bars_html = bar("Grafik Gücü", r["Tek"]) + bar("Para Girişi", r["Para"])
+        if is_swing and r.get("Temel") is not None:
+            bars_html += bar("Bilanço Sağlamlığı", r["Temel"])
+        st.markdown(bars_html, unsafe_allow_html=True)
         st.markdown("**Kontrol Listesi:**")
         for l, ok in r["Kontroller"]:
             st.write(("✅ " if ok else "⬜ ") + l)
@@ -553,7 +649,7 @@ def card(r, info, frows, mode_name):
 # ---------- Arayüz ----------
 st.markdown(
     '<div class="hdr"><h1>📈 BIST Kolay Hisse Tarayıcı</h1>'
-    '<p>Karmaşık grafiklerle uğraşmadan; ne alacağını, kaç adet alacağını ve nerede satacağını gösteren akıllı rehber.</p></div>',
+    '<p>İster otomatik taranan fırsatları gör, ister kendi istediğin hisseyi yazıp teknik & temel bazlı Stop/Hedef planı çıkar.</p></div>',
     unsafe_allow_html=True
 )
 st_autorefresh(interval=15 * 60 * 1000, key="auto")
@@ -563,25 +659,23 @@ with st.container(border=True):
     st.markdown("#### ⚙️ 1. Adım: Kendi Planını Seç")
     col1, col2, col3 = st.columns(3)
     with col1:
-        capital = st.number_input("Toplam Yatırım Bütçen (TL)", min_value=5_000, max_value=100_000_000, value=50_000, step=5_000,
-                                  help="Borsada bu strateji için ayırdığın toplam para.")
+        capital = st.number_input("Toplam Yatırım Bütçen (TL)", min_value=5_000, max_value=100_000_000, value=50_000, step=5_000)
     with col2:
         mode = st.selectbox("Ne Kadar Süre Tutacaksın?", [
             "⚡ Gün İçi Al-Sat (Aynı gün kapat)",
             "🌊 Birkaç Günlük / Haftalık (Swing)"
-        ], index=1, help="Yeni başlayanlar için 'Birkaç Günlük / Haftalık' modu daha sakin ve stressizdir.")
+        ], index=1)
     with col3:
         prof = st.selectbox("Risk Tercihin Nedir?", list(PROFILES), index=1)
 
     with st.expander("🛠️ Gelişmiş Ayarlar (İsteğe Bağlı)"):
         adv1, adv2, adv3 = st.columns(3)
         with adv1:
-            risk_pct = st.slider("Tek işlemde göze alınan maks. zarar (%)", 0.5, 2.5, 1.0, 0.25,
-                                 help="Örn: 50.000 TL bütçede %1 seçersen, bir işlem stop olsa bile en fazla 500 TL kaybedersin.")
+            risk_pct = st.slider("Tek işlemde göze alınan maks. zarar (%)", 0.5, 2.5, 1.0, 0.25)
         with adv2:
             regime_strict = st.checkbox("Borsa düşerken uyarı ver (Endeks Koruması)", value=True)
         with adv3:
-            tf = st.selectbox("Bilanço Filtresi (Sadece çok günlük modda)", ["Kapalı", "Orta (Önerilen)", "Sıkı"], index=1)
+            tf = st.selectbox("Bilanço Filtresi (Çok günlük modda)", ["Kapalı", "Orta (Önerilen)", "Sıkı"], index=1)
 
         banned_input = st.text_input("Yasaklı / Brüt Takas Hisseleri (Otomatik hariç tutulur)",
                                      value=", ".join(sorted(DEFAULT_BANNED)))
@@ -594,7 +688,6 @@ rv, c_lo, c_hi, r_lo, r_hi, min_tl, min_atr = PROFILES[prof]
 params = dict(capital=capital, risk_pct=risk_pct, rvol=rv, chg_lo=c_lo, chg_hi=c_hi, rsi_lo=r_lo, rsi_hi=r_hi)
 min_temel = {"Kapalı": 0, "Orta (Önerilen)": 50, "Sıkı": 65}[tf] if "Birkaç Günlük" in mode else 0
 
-# Piyasa Durumu Bilgisi
 state, msg = market_status()
 xu15, xu1d = get_xu100()
 regime = check_market_regime(xu15, xu1d)
@@ -620,10 +713,10 @@ else:
     fund = {}
     fs = {t: (None, 0, []) for t in watch}
 
-# Sadeleştirilmiş 4 Sekme
+# 4 Sekme
 tab1, tab2, tab3, tab4 = st.tabs([
     "🎯 Günün Fırsatları",
-    "📒 İşlemlerim",
+    "📒 Takip Listem & İşlemlerim",
     "📖 Nasıl Kullanılır?",
     "🧪 Geçmiş Başarı Testi"
 ])
@@ -631,11 +724,46 @@ tab1, tab2, tab3, tab4 = st.tabs([
 PARA_TXT = {0: "Para girişi zayıf", 1: "Para girişi zayıf", 2: "Para girişi orta", 3: "Para girişi güçlü"}
 
 with tab1:
+    # --- YENİ: İSTEDİĞİN HİSSEYİ SOR & STOP/HEDEF OLUŞTUR ---
+    with st.container(border=True):
+        st.markdown("#### 🔎 İstediğin Hisse İçin Teknik & Temel Bazlı Plan Oluştur")
+        q1, q2 = st.columns([3, 1])
+        with q1:
+            custom_ticker = st.text_input("Hisse Kodu Yaz (Örn: THYAO, ASELS, EREGL, TUPRS)", placeholder="Hisse kodunu yazıp Enter'a basın veya butona tıklayın...").strip().upper()
+        with q2:
+            st.write("")
+            st.write("")
+            analyze_custom_btn = st.button("🎯 Plan Oluştur", use_container_width=True)
+
+        if custom_ticker or analyze_custom_btn:
+            if custom_ticker:
+                with st.spinner(f"{custom_ticker} için teknik ve temel veriler analiz ediliyor..."):
+                    t_clean, d1d_c, d15_c, info_c = get_single_stock_data(custom_ticker)
+                if d1d_c.empty or len(d1d_c) < 55:
+                    st.error(f"❌ '{custom_ticker}' kodu için yeterli BIST verisi bulunamadı. Kodu doğru yazdığınızdan emin olun (Örn: THYAO).")
+                else:
+                    daily_atr_c = float(atr(d1d_c).iloc[-1])
+                    sc_c, _, frows_c = fund_score(info_c)
+                    fp_c, _, _, _ = flow(d1d_c)
+                    if "Gün İçi" in mode and not d15_c.empty:
+                        item_c = analyze_intraday(t_clean, d15_c, params, daily_atr_c)
+                    else:
+                        item_c = analyze_swing(t_clean, d1d_c, params, daily_atr_c, temel_puan=sc_c)
+
+                    if item_c:
+                        item_c["Temel"] = sc_c
+                        item_c["Para"] = fp_c / 3 * 100
+                        item_c["ParaTxt"] = PARA_TXT[fp_c]
+                        item_c["Genel"] = overall_intraday(item_c["Tek"], item_c["Para"]) if "Gün İçi" in mode else overall_swing(item_c["Tek"], item_c["Temel"], item_c["Para"])
+                        card(item_c, info_c, frows_c, mode, key_prefix="custom")
+
+    st.divider()
+
     if regime_strict and not regime["ok"]:
         st.warning("⚠️ **Dikkat:** Borsa İstanbul genelinde düşüş baskısı var. Piyasa yatışana kadar alım yapmamak paranızı korur.")
 
     if not watch:
-        st.info("Şu an kriterlere uyan güvenli bir hisse bulunamadı. Piyasa uygun olmadığında beklemek en iyi stratejidir.")
+        st.info("Şu an otomatik taramada kriterlere uyan hisse bulunamadı. Yukarıdaki kutudan kendi istediğin hisseyi yazıp analiz edebilirsin.")
     else:
         drow = dtab.set_index("Hisse")
         res = []
@@ -649,14 +777,14 @@ with tab1:
             for t in watch:
                 d = daily.get(t)
                 if d is not None:
-                    item = analyze_swing(t, d, params, float(drow.loc[t, "DailyATR"]))
+                    sc_t = fs[t][0]
+                    item = analyze_swing(t, d, params, float(drow.loc[t, "DailyATR"]), temel_puan=sc_t)
                     if item:
                         res.append(item)
 
         for x in res:
             t = x["Hisse"]
             fpt = int(drow.loc[t, "ParaP"])
-            x["Tek"] = x["Puan"] / x["Toplam"] * 100
             x["Temel"] = fs[t][0]
             x["Para"] = fpt / 3 * 100
             x["ParaTxt"] = PARA_TXT[fpt]
@@ -667,29 +795,61 @@ with tab1:
         near = sorted([x for x in res if x["Puan"] == x["Toplam"] - 1 and okt(x)], key=lambda x: -x["Genel"])
 
         if not opp:
-            st.info("Bugün tüm şartları eksiksiz karşılayan bir fırsat çıkmadı. Zorlama işlem açmayın.")
+            st.info("Bugün otomatik taramada tüm şartları eksiksiz karşılayan fırsat çıkmadı. Yukarıdan kendi hisseni sorgulayabilir veya aşağıdaki izleme listesine bakabilirsin.")
         else:
-            st.markdown(f"#### ✨ Senin İçin Seçilen En Güçlü {min(len(opp), 5)} Fırsat")
+            st.markdown(f"#### ✨ Otomatik Taramada Öne Çıkan En Güçlü {min(len(opp), 5)} Fırsat")
             for x in opp[:5]:
                 t = x["Hisse"]
-                card(x, fund.get(t, {}), fs[t][2], mode)
+                card(x, fund.get(t, {}), fs[t][2], mode, key_prefix="opp")
 
         if near:
-            with st.expander(f"👀 İzleme Listesi ({len(near)} hisse - 1 şartı eksik, yakında fırsata dönüşebilir)"):
-                for x in near[:8]:
-                    missing = [l for l, ok in x["Kontroller"] if not ok][0]
-                    st.write(f"**{x['Hisse']}** ({tl(x['Fiyat'])} TL) → Beklenen şart: *{missing}*")
+            st.markdown(f"#### 👀 İzleme Listesi ({len(near)} hisse - 1 şartı eksik, takibe alabilirsin)")
+            for x in near[:5]:
+                t = x["Hisse"]
+                card(x, fund.get(t, {}), fs[t][2], mode, key_prefix="near")
 
 with tab2:
-    st.subheader("📒 Takibe Aldığım İşlemler")
-    st.write("Fırsat kartlarındaki **'📝 Takibe Al'** butonuna bastığın hisseler buraya kaydedilir.")
+    st.subheader("📒 Takibe Aldığım Hisseler & İşlemlerim")
+    st.write("Günün Fırsatları sekmesinden **'📝 Takibe Al'** dediğinde hisseler, teknik & temel bazlı Stop/Hedef seviyeleriyle buraya kaydedilir.")
+
+    # --- YENİ: TAKİP LİSTESİNE DOĞRUDAN HİSSE EKLEME KUTUSU ---
+    with st.container(border=True):
+        st.markdown("**➕ Takip Listene Doğrudan Hisse Ekle (Otomatik Teknik & Temel Stop/Hedef Hesaplar)**")
+        a1, a2, a3 = st.columns([2, 2, 1])
+        with a1:
+            add_tk = st.text_input("Hisse Kodu (Örn: GARAN)", key="add_tk_input").strip().upper()
+        with a2:
+            custom_entry = st.number_input("Alış Maliyetin (0 bırakırsan güncel fiyatı alır)", min_value=0.0, value=0.0, step=0.1)
+        with a3:
+            st.write("")
+            st.write("")
+            if st.button("➕ Hesapla ve Ekle", use_container_width=True, type="primary"):
+                if add_tk:
+                    with st.spinner(f"{add_tk} için teknik ve temel destek/hedefler hesaplanıyor..."):
+                        t_clean, d1d_a, _, info_a = get_single_stock_data(add_tk)
+                    if d1d_a.empty or len(d1d_a) < 30:
+                        st.error("Hisse verisi bulunamadı. Kodu kontrol edin.")
+                    else:
+                        daily_atr_a = float(atr(d1d_a).iloc[-1])
+                        sc_a, _, _ = fund_score(info_a)
+                        entry_a = custom_entry if custom_entry > 0 else float(d1d_a["Close"].iloc[-1])
+                        ema20_a = float(ema(d1d_a["Close"], 20).iloc[-1])
+                        recent_low_a = float(d1d_a["Low"].tail(5).min())
+                        raw_sup_a = max(ema20_a, recent_low_a)
+                        if raw_sup_a >= entry_a:
+                            raw_sup_a = entry_a - 0.5 * daily_atr_a
+                        plan_a = compute_smart_plan(entry_a, raw_sup_a, daily_atr_a, capital, risk_pct, sc_a, 75, is_swing=True)
+                        add_trade(mode, t_clean, entry_a, plan_a["stop"], plan_a["target1"], plan_a["target2"], plan_a["lot"])
+                        st.success(f"✅ {t_clean} eklendi! Alış: {tl(entry_a)} TL | Stop: {tl(plan_a['stop'])} TL | 1. Hedef: {tl(plan_a['target1'])} TL")
+                        st.rerun()
+
     tdf = get_trades()
     if tdf.empty:
-        st.info("Henüz takip listene bir hisse eklemedin.")
+        st.info("Henüz takip listende bir hisse yok. Yukarıdan hisse kodu yazıp ekleyebilir veya 'Günün Fırsatları' sekmesindeki '📝 Takibe Al' butonunu kullanabilirsin.")
     else:
         closed = tdf[tdf["status"] != "AÇIK"]
         c1, c2, c3, c4 = st.columns(4)
-        c1.metric("Toplam İşlem", len(tdf))
+        c1.metric("Toplam Takip", len(tdf))
         c2.metric("Devam Eden", len(tdf[tdf["status"] == "AÇIK"]))
         if not closed.empty and closed["pnl"].notna().any():
             wins = len(closed[closed["pnl"] > 0])
@@ -699,13 +859,13 @@ with tab2:
             c3.metric("Başarı Oranı", "-")
             c4.metric("Toplam Kâr / Zarar", "0,00 TL")
 
-        show_tdf = tdf[["id", "created_at", "ticker", "entry", "stop", "target1", "lot", "status", "exit_price", "pnl"]].copy()
-        show_tdf.columns = ["No", "Tarih", "Hisse", "Alış", "Zarar Kes", "1. Hedef", "Adet", "Durum", "Satış Fiyatı", "Net Kâr/Zarar (TL)"]
+        show_tdf = tdf[["id", "created_at", "ticker", "entry", "stop", "target1", "target2", "lot", "status", "exit_price", "pnl"]].copy()
+        show_tdf.columns = ["No", "Tarih", "Hisse", "Alış", "Zarar Kes (Stop)", "1. Hedef", "2. Hedef", "Adet", "Durum", "Satış", "Net Kâr/Zarar (TL)"]
         st.dataframe(show_tdf, use_container_width=True, hide_index=True)
 
         with st.container(border=True):
-            st.markdown("**İşlemi Kapat / Güncelle**")
-            u1, u2, u3, u4 = st.columns([1, 1.5, 1.5, 1])
+            st.markdown("**İşlemi Güncelle / Kapat / Sil**")
+            u1, u2, u3, u4, u5 = st.columns([1, 1.5, 1.3, 1, 1])
             with u1:
                 sel_id = st.selectbox("İşlem No", tdf["id"].tolist())
             with u2:
@@ -718,28 +878,25 @@ with tab2:
                 if st.button("Kaydet", use_container_width=True):
                     update_trade_status(sel_id, new_status, exit_p if exit_p > 0 else None)
                     st.rerun()
+            with u5:
+                st.write("")
+                st.write("")
+                if st.button("🗑️ Sil", use_container_width=True):
+                    delete_trade(sel_id)
+                    st.rerun()
 
 with tab3:
     st.markdown("""
 ### 👋 Hiç Bilmeyenler İçin 4 Adımda Kullanım Rehberi
 
-Bu uygulama, yüzlerce hisse arasından yalnızca **yükseliş trendinde olan, hacmi güçlü ve riski hesaplanabilir** hisseleri senin yerine süzer.
-
-1. **Bütçeni ve Süreni Seç:** Üst kutudan borsaya ayırdığın parayı yaz. Yeni başlıyorsan **"Birkaç Günlük / Haftalık"** modunu ve **"Dengeli"** profili seç.
-2. **Alış ve Adet Miktarına Bak:** Sistem senin bütçene göre kaç adet hisse alman gerektiğini otomatik hesaplar. *Tek bir hissede asla tüm paranı riske atmaz.*
-3. **Önce Zarar Kes (Stop) Emrini Gir:** Aracı kurum uygulamandan hisseyi aldıktan hemen sonra, kartta yazan **Zarar Kes (Stop)** fiyatına satış emri (zincir/stop emir) koy. Böylece piyasa tersine dönerse kaybın en baştan sınırlanır.
-4. **Hedef Gelince Kârını Al:** Hisse **1. Kâr Hedefi** fiyatına ulaştığında elindeki hisselerin yarısını satarak kârını cebine koy, kalan yarısını **2. Kâr Hedefi** için beklet.
-
----
-**💡 Altın Kurallar:**
-* **Fırsat yoksa işlem yapma:** Ekranda hisse çıkmıyorsa piyasa tehlikelidir; nakitte kalmak da kazançtır.
-* **Zarar kes fiyatını asla aşağı çekme:** "Belki döner" diyerek stop seviyesini bozmak borsadaki en büyük hatadır.
-* **Fiyatı kontrol et:** Buradaki fiyatlar ücretsiz kaynak nedeniyle ~15 dakika gecikmelidir. Alım tuşuna basmadan önce banka/aracı kurum uygulamandan anlık fiyata mutlaka bak.
+1. **Bütçeni ve Süreni Seç:** Üst kutudan borsaya ayırdığın parayı yaz. Yeni başlıyorsan **"Birkaç Günlük / Haftalık"** modunu seç.
+2. **İster Seçilenleri Gör, İster Kendi Hisseni Yaz:** "Günün Fırsatları" sekmesinde hem sistemin bulduğu hisseleri görebilir hem de arama kutusuna istediğin hisseyi yazıp teknik + bilanço bazlı Stop ve Hedef seviyelerini çıkarabilirsin.
+3. **'📝 Takibe Al' Butonuna Bas:** Beğendiğin hisseyi tek tuşla **Takip Listem & İşlemlerim** sekmesine kaydet.
+4. **Önce Stop, Sonra Hedef:** Aracı kurum uygulamandan alım yaptıktan sonra mutlaka tabloda yazan **Zarar Kes (Stop)** seviyesine satış emri gir.
 """)
 
 with tab4:
     st.subheader("🧪 Bu Strateji Geçmişte Ne Kazandırdı?")
-    st.write("Aşağıdaki butona basarak seçili kuralların son 1 yılda BIST'in en büyük hisselerindeki gerçek performansını test edebilirsin.")
     b1, b2 = st.columns(2)
     with b1:
         bt_sample = st.slider("Test edilecek büyük hisse sayısı", 15, 60, 30, 5)
@@ -762,7 +919,6 @@ with tab4:
                 m3.metric("Kazanç / Kayıp Gücü", f"{bt_res['profit_factor']:.2f}x")
                 m4.metric("Net Performans (Risk Birimi)", f"{bt_res['net_r']:+.1f} R")
                 st.line_chart(bt_res["df"]["Kümülatif Kazanç (R)"])
-                st.caption("Not: 1R, tek işlemde göze aldığın zarar tutarıdır (Örn: %1 risk ile +15R = 1 yılda +%15 net portföy artışı).")
 
 st.divider()
 st.caption("⚠️ Bu uygulama yalnızca eğitim ve karar destek amaçlıdır, kesin yatırım tavsiyesi değildir.")
