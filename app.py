@@ -92,13 +92,20 @@ def get_trades():
         return pd.read_sql_query("SELECT * FROM trades ORDER BY id DESC", conn)
 
 
-def update_trade_status(trade_id, status, exit_price=None):
+def update_trade_status(trade_id, status, exit_price=None, new_entry=None, new_lot=None):
     with sqlite3.connect(DB_PATH) as conn:
         row = conn.execute("SELECT entry, lot FROM trades WHERE id = ?", (trade_id,)).fetchone()
+        if not row:
+            return
+        entry_val = round(float(new_entry), 2) if (new_entry is not None and new_entry > 0) else row[0]
+        lot_val = int(new_lot) if (new_lot is not None and new_lot > 0) else row[1]
         pnl = None
-        if row and exit_price is not None and exit_price > 0:
-            pnl = round((exit_price - row[0]) * row[1], 2)
-        conn.execute("UPDATE trades SET status = ?, exit_price = ?, pnl = ? WHERE id = ?", (status, exit_price, pnl, trade_id))
+        if exit_price is not None and exit_price > 0:
+            pnl = round((exit_price - entry_val) * lot_val, 2)
+        conn.execute(
+            "UPDATE trades SET entry = ?, lot = ?, status = ?, exit_price = ?, pnl = ? WHERE id = ?",
+            (entry_val, lot_val, status, exit_price, pnl, trade_id)
+        )
 
 
 def delete_trade(trade_id):
@@ -629,9 +636,15 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
-    # --- CANLI FİYAT GİRİŞİ + TAKİBE AL SATIRI ---
+    # --- CANLI FİYAT GİRİŞİ + TEMİZLE + TAKİBE AL SATIRI ---
     live_dict = st.session_state.setdefault("live_prices", {})
-    c_live_in, c_live_btn, c_track_btn = st.columns([2.2, 1.3, 1.3])
+    inp_key = f"inp_live_{key_prefix}_{mode_name}_{r['Hisse']}"
+    if is_live:
+        c_live_in, c_live_btn, c_clear_btn, c_track_btn = st.columns([2.0, 1.35, 0.95, 1.25])
+    else:
+        c_live_in, c_live_btn, c_track_btn = st.columns([2.2, 1.4, 1.3])
+        c_clear_btn = None
+
     with c_live_in:
         entered_live = st.number_input(
             f"{r['Hisse']} Anlık Fiyat (TL)",
@@ -639,7 +652,7 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
             value=float(live_dict.get(r["Hisse"], 0.0)),
             step=0.05,
             format="%.2f",
-            key=f"inp_live_{key_prefix}_{mode_name}_{r['Hisse']}",
+            key=inp_key,
             label_visibility="collapsed",
             help="Aracı kurumundan gördüğün anlık fiyatı yazıp 'Fiyatı Uygula'ya bas; tüm teknik puan, stop, hedef ve adet anında yeniden hesaplansın."
         )
@@ -650,6 +663,13 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
             else:
                 live_dict.pop(r["Hisse"], None)
             st.rerun()
+    if c_clear_btn is not None:
+        with c_clear_btn:
+            if st.button("🧹 Temizle", key=f"btn_clr_{key_prefix}_{mode_name}_{r['Hisse']}", use_container_width=True, help="Sadece bu hisse için girilen anlık fiyatı sil ve gecikmeli veriye dön"):
+                live_dict.pop(r["Hisse"], None)
+                if inp_key in st.session_state:
+                    del st.session_state[inp_key]
+                st.rerun()
     with c_track_btn:
         if st.button("📝 Takibe Al", key=f"log_{key_prefix}_{mode_name}_{r['Hisse']}", use_container_width=True, type="primary"):
             add_trade(mode_name, r["Hisse"], r["Fiyat"], r["Stop"], r["Hedef1"], r["Hedef2"], r["Lot"])
@@ -664,7 +684,9 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
         failed_checks = [l for l, ok in r["Kontroller"] if not ok]
         st.error(
             f"🚨 **Anlık Fiyat Uyarısı:** Girdiğin **{tl(r['Fiyat'])} TL** fiyatıyla bu hisse **{len(failed_checks)} teknik kuralı bozdu!** "
-            f"(Bozulan: *{failed_checks[0]}*). Alım yapmadan önce tekrar düşün."
+            f"(Bozulan: *{failed_checks[0]}*).\n\n"
+            f"📌 **Yine de Alınırsa Önerilen Alım:** **{r['Lot']} adet** (Yaklaşık **{tl(total_cost)} TL**) • "
+            f"Stop olursa kayıp: **{tl(max_loss)} TL** • 1. hedefte kâr: **{tl(est_gain)} TL**."
         )
     elif r.get("IsWide"):
         st.warning(
@@ -931,24 +953,61 @@ with tab2:
         st.dataframe(show_tdf, use_container_width=True, hide_index=True)
 
         with st.container(border=True):
-            st.markdown("**İşlemi Güncelle / Kapat / Sil**")
-            u1, u2, u3, u4, u5 = st.columns([1, 1.5, 1.3, 1, 1])
+            st.markdown("**✏️ İşlemi Düzenle / Kapat / Sil**")
+            sel_id = st.selectbox(
+                "Düzenlenecek İşlem",
+                tdf["id"].tolist(),
+                format_func=lambda x: f"No #{x} • {tdf.loc[tdf['id'] == x, 'ticker'].values[0]} (Alış: {tl(tdf.loc[tdf['id'] == x, 'entry'].values[0])} TL • {tdf.loc[tdf['id'] == x, 'lot'].values[0]} adet)"
+            )
+            cur_row = tdf[tdf["id"] == sel_id].iloc[0]
+            status_opts = ["AÇIK", "KÂR İLE KAPATILDI", "ZARAR KES OLDU"]
+            cur_status_idx = status_opts.index(cur_row["status"]) if cur_row["status"] in status_opts else 0
+
+            u1, u2, u3, u4 = st.columns(4)
             with u1:
-                sel_id = st.selectbox("İşlem No", tdf["id"].tolist())
+                edit_entry = st.number_input(
+                    "Gerçek Alış Fiyatın (TL)",
+                    min_value=0.01,
+                    value=float(cur_row["entry"]),
+                    step=0.05,
+                    format="%.2f",
+                    key=f"edit_entry_{sel_id}"
+                )
             with u2:
-                new_status = st.selectbox("Sonuç", ["KÂR İLE KAPATILDI", "ZARAR KES OLDU", "AÇIK"])
+                edit_lot = st.number_input(
+                    "Aldığın Adet (Lot)",
+                    min_value=1,
+                    value=int(cur_row["lot"]),
+                    step=1,
+                    key=f"edit_lot_{sel_id}"
+                )
             with u3:
-                exit_p = st.number_input("Sattığın Fiyat (TL)", min_value=0.0, value=0.0, step=0.1)
+                new_status = st.selectbox("İşlem Durumu", status_opts, index=cur_status_idx, key=f"edit_status_{sel_id}")
             with u4:
-                st.write("")
-                st.write("")
-                if st.button("Kaydet", use_container_width=True):
-                    update_trade_status(sel_id, new_status, exit_p if exit_p > 0 else None)
+                cur_exit = float(cur_row["exit_price"]) if pd.notna(cur_row["exit_price"]) else 0.0
+                exit_p = st.number_input(
+                    "Sattığın Fiyat (TL) (Açık ise 0)",
+                    min_value=0.0,
+                    value=cur_exit,
+                    step=0.05,
+                    format="%.2f",
+                    key=f"edit_exit_{sel_id}"
+                )
+
+            b1, b2 = st.columns([3, 1])
+            with b1:
+                if st.button("💾 Değişiklikleri Kaydet", use_container_width=True, type="primary"):
+                    update_trade_status(
+                        sel_id,
+                        new_status,
+                        exit_p if exit_p > 0 else None,
+                        new_entry=edit_entry,
+                        new_lot=edit_lot
+                    )
+                    st.toast(f"✅ #{sel_id} ({cur_row['ticker']}) güncellendi!", icon="💾")
                     st.rerun()
-            with u5:
-                st.write("")
-                st.write("")
-                if st.button("🗑️ Sil", use_container_width=True):
+            with b2:
+                if st.button("🗑️ İşlemi Sil", use_container_width=True):
                     delete_trade(sel_id)
                     st.rerun()
 
