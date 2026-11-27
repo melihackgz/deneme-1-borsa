@@ -905,9 +905,7 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
         failed_checks = [l for l, ok in r["Kontroller"] if not ok]
         st.error(
             f"🚨 **Anlık Fiyat Uyarısı:** Girdiğin **{tl(r['Fiyat'])} TL** fiyatıyla bu hisse **{len(failed_checks)} teknik kuralı bozdu!** "
-            f"(Bozulan: *{failed_checks[0]}*).
-
-"
+            f"(Bozulan: *{failed_checks[0]}*).\n\n"
             f"📌 **Yine de Alınırsa Önerilen Alım:** **{r['Lot']} adet** (Yaklaşık **{tl(total_cost)} TL**) • "
             f"Stop olursa kayıp: **{tl(max_loss)} TL** • 1. hedefte kâr: **{tl(est_gain)} TL**."
         )
