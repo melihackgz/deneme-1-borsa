@@ -213,7 +213,7 @@ def verdict(g):
     return ("ÇOK GÜÇLÜ", "#16a34a") if g >= 75 else ("UYGUN", "#2563eb") if g >= 60 else ("DİKKATLİ OL", "#d97706")
 
 
-# ---------- Çok Katmanlı Veri Motoru (TradingView + İş Yatırım + Yahoo Fallback) ----------
+# ---------- Hızlı & Sağlam Veri Motoru ----------
 _HTTP_HEADERS = {
     "User-Agent": "Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/124.0.0.0 Safari/537.36",
     "Accept": "application/json, text/plain, */*",
@@ -227,8 +227,7 @@ def _normalize_ohlcv(df):
     df = df.copy()
     if isinstance(df.columns, pd.MultiIndex):
         df.columns = df.columns.get_level_values(0)
-    rename_map = {c: c.capitalize() for c in df.columns}
-    df = df.rename(columns=rename_map)
+    df = df.rename(columns={c: c.capitalize() for c in df.columns})
     req = ["Open", "High", "Low", "Close", "Volume"]
     if not all(c in df.columns for c in req):
         return pd.DataFrame()
@@ -241,9 +240,41 @@ def _normalize_ohlcv(df):
     return df[~df.index.duplicated(keep="last")].sort_index()
 
 
+def _fetch_yahoo_bulk(tickers, period, interval):
+    """Toplu taramalarda yüzlerce hisseyi tek seferde 2-3 saniyede indirir."""
+    out = {}
+    tickers = list(tickers)
+    for i in range(0, len(tickers), 120):
+        chunk = tickers[i:i + 120]
+        try:
+            raw = yf.download(
+                [t + ".IS" for t in chunk],
+                period=period,
+                interval=interval,
+                group_by="ticker",
+                progress=False,
+                threads=True,
+                auto_adjust=False,
+                timeout=12
+            )
+        except Exception:
+            continue
+        if raw is None or raw.empty:
+            continue
+        for t in chunk:
+            try:
+                d = raw[t + ".IS"] if len(chunk) > 1 else raw
+            except KeyError:
+                continue
+            norm = _normalize_ohlcv(d)
+            if len(norm) >= 30:
+                out[t] = norm
+    return out
+
+
 def _fetch_tv_history(tickers, interval="1d", n_bars=260):
-    """TradingView (tvDatafeed) üzerinden BIST OHLCV mumlarını çeker."""
-    if not HAS_TV_FEED:
+    """Tekil veya az sayıda hisse için TradingView'den doğrudan BIST mum verisi çeker."""
+    if not HAS_TV_FEED or not tickers:
         return {}
     out = {}
     try:
@@ -262,15 +293,15 @@ def _fetch_tv_history(tickers, interval="1d", n_bars=260):
             pass
         return t, None
 
-    with ThreadPoolExecutor(6) as ex:
-        for t, res in ex.map(one, tickers):
+    with ThreadPoolExecutor(4) as ex:
+        for t, res in ex.map(one, list(tickers)[:25]):
             if res is not None:
                 out[t] = res
     return out
 
 
 def _fetch_isyatirim_daily(tickers):
-    """İş Yatırım halka açık tarihi fiyat servisinden günlük kapanış/hacim serilerini çeker."""
+    """İş Yatırım servisinden günlük OHLCV verisi çeker."""
     out = {}
     end_dt = datetime.now()
     start_dt = end_dt - timedelta(days=375)
@@ -280,7 +311,7 @@ def _fetch_isyatirim_daily(tickers):
     def one(t):
         url = f"https://www.isyatirim.com.tr/_layouts/15/Isyatirim.Website/Common/Data.aspx/HisseTekil?hisse={t}&startdate={s_str}&enddate={e_str}"
         try:
-            resp = requests.get(url, headers=_HTTP_HEADERS, timeout=8)
+            resp = requests.get(url, headers=_HTTP_HEADERS, timeout=5)
             if resp.status_code != 200:
                 return t, None
             payload = resp.json().get("value") or []
@@ -290,74 +321,47 @@ def _fetch_isyatirim_daily(tickers):
             for item in payload:
                 dt_str = item.get("HGDG_TARIH")
                 c = item.get("HGDG_KAPANIS")
-                h = item.get("HGDG_MAX") or c
-                l = item.get("HGDG_MIN") or c
-                o = item.get("HGDG_AOF") or c
-                v = item.get("HGDG_HACIM") or 0
                 if dt_str and c is not None:
                     rows.append({
                         "Date": pd.to_datetime(dt_str, format="%d-%m-%Y"),
-                        "Open": float(o),
-                        "High": float(h),
-                        "Low": float(l),
+                        "Open": float(item.get("HGDG_AOF") or c),
+                        "High": float(item.get("HGDG_MAX") or c),
+                        "Low": float(item.get("HGDG_MIN") or c),
                         "Close": float(c),
-                        "Volume": float(v)
+                        "Volume": float(item.get("HGDG_HACIM") or 0)
                     })
             if len(rows) < 30:
                 return t, None
-            df = pd.DataFrame(rows).set_index("Date")
-            return t, _normalize_ohlcv(df)
+            return t, _normalize_ohlcv(pd.DataFrame(rows).set_index("Date"))
         except Exception:
             return t, None
 
-    with ThreadPoolExecutor(8) as ex:
-        for t, res in ex.map(one, tickers):
+    with ThreadPoolExecutor(6) as ex:
+        for t, res in ex.map(one, list(tickers)[:25]):
             if res is not None and len(res) >= 30:
                 out[t] = res
     return out
 
 
-def _fetch_yahoo_bulk(tickers, period, interval):
-    out = {}
-    for i in range(0, len(tickers), 100):
-        chunk = tickers[i:i + 100]
-        try:
-            raw = yf.download([t + ".IS" for t in chunk], period=period, interval=interval,
-                              group_by="ticker", progress=False, threads=True, auto_adjust=False)
-        except Exception:
-            continue
-        for t in chunk:
-            try:
-                d = raw[t + ".IS"] if len(chunk) > 1 else raw
-            except KeyError:
-                continue
-            norm = _normalize_ohlcv(d)
-            if len(norm) >= 30:
-                out[t] = norm
-    return out
-
-
-@st.cache_data(ttl=3600, show_spinner="BIST hisseleri İş Yatırım & TradingView üzerinden taranıyor...")
+@st.cache_data(ttl=3600, show_spinner="BIST hisseleri hızlı tarama motoruyla yükleniyor...")
 def get_daily(tickers):
     tickers = list(tickers)
-    out = {}
-    # 1. Öncelik: TradingView (tvDatafeed)
-    if HAS_TV_FEED:
-        out.update(_fetch_tv_history(tickers, interval="1d", n_bars=260))
-    # 2. Eksikler için İş Yatırım
+    # 1. Hızlı Toplu Tarama: Tüm evreni tek seferde indir (500+ hisse ~3 sn)
+    out = _fetch_yahoo_bulk(tickers, "1y", "1d")
+    # 2. Eksik kalan az sayıdaki hisse için TradingView / İş Yatırım tamamlayıcısı
     missing = [t for t in tickers if t not in out]
-    if missing:
-        out.update(_fetch_isyatirim_daily(missing))
-    # 3. Kalan eksikler için Yahoo Finance yedeği
-    missing = [t for t in tickers if t not in out]
-    if missing:
-        out.update(_fetch_yahoo_bulk(missing, "1y", "1d"))
+    if missing and len(missing) <= 30:
+        if HAS_TV_FEED:
+            out.update(_fetch_tv_history(missing, interval="1d", n_bars=260))
+        still_missing = [t for t in missing if t not in out]
+        if still_missing:
+            out.update(_fetch_isyatirim_daily(still_missing))
     return out
 
 
-@st.cache_data(ttl=180, show_spinner="Anlık 15 dakikalık grafikler TradingView üzerinden çekiliyor...")
+@st.cache_data(ttl=180, show_spinner="Filtrelenen hisselerin 15 dakikalık grafikleri alınıyor...")
 def get_intraday(tickers):
-    tickers = list(tickers)
+    tickers = list(tickers)[:35]
     out = {}
     if HAS_TV_FEED:
         out.update(_fetch_tv_history(tickers, interval="15m", n_bars=160))
@@ -367,9 +371,9 @@ def get_intraday(tickers):
     return out
 
 
-@st.cache_data(ttl=180)
+@st.cache_data(ttl=120)
 def get_tv_realtime_snapshot(tickers):
-    """TradingView TA üzerinden seçili hisselerin anlık fiyatını çeker."""
+    """Filtreden geçen aday hisselerin TradingView anlık fiyatını çeker."""
     if not HAS_TV_TA or not tickers:
         return {}
 
@@ -391,7 +395,7 @@ def get_tv_realtime_snapshot(tickers):
 
     snaps = {}
     with ThreadPoolExecutor(6) as ex:
-        for t, price in ex.map(one, list(tickers)[:30]):
+        for t, price in ex.map(one, list(tickers)[:20]):
             if price is not None:
                 snaps[t] = price
     return snaps
@@ -402,16 +406,14 @@ def get_xu100():
     d15 = pd.DataFrame()
     d1d = pd.DataFrame()
     if HAS_TV_FEED:
-        tv_15 = _fetch_tv_history(["XU100"], interval="15m", n_bars=120)
-        tv_1d = _fetch_tv_history(["XU100"], interval="1d", n_bars=130)
-        d15 = tv_15.get("XU100", pd.DataFrame())
-        d1d = tv_1d.get("XU100", pd.DataFrame())
+        d15 = _fetch_tv_history(["XU100"], interval="15m", n_bars=120).get("XU100", pd.DataFrame())
+        d1d = _fetch_tv_history(["XU100"], interval="1d", n_bars=130).get("XU100", pd.DataFrame())
     if d15.empty or d1d.empty:
         try:
             if d15.empty:
-                d15 = _normalize_ohlcv(yf.download("XU100.IS", period="5d", interval="15m", progress=False, auto_adjust=False))
+                d15 = _normalize_ohlcv(yf.download("XU100.IS", period="5d", interval="15m", progress=False, auto_adjust=False, timeout=8))
             if d1d.empty:
-                d1d = _normalize_ohlcv(yf.download("XU100.IS", period="6mo", interval="1d", progress=False, auto_adjust=False))
+                d1d = _normalize_ohlcv(yf.download("XU100.IS", period="6mo", interval="1d", progress=False, auto_adjust=False, timeout=8))
         except Exception:
             pass
     return d15, d1d
@@ -419,16 +421,13 @@ def get_xu100():
 
 @st.cache_data(ttl=43200)
 def _fetch_isyatirim_fundamental_map():
-    """İş Yatırım Temel Analiz / Oranlar tablosundan tüm BIST hisselerinin F/K, PD/DD, ROE vb. oranlarını tek seferde çeker."""
-    url = "https://www.isyatirim.com.tr/_layouts/15/Isyatirim.Website/Common/Data.aspx/OneEndeks?endeks=00"
-    # Alternatif ana hisse oranları servisi:
-    ratios_url = "https://www.isyatirim.com.tr/_layouts/15/Isyatirim.Website/StockInfo/CompanyInfoAjax.aspx/GetTemelAnaliz"
+    """İş Yatırım tablosundan tüm BIST hisselerinin F/K, PD/DD, ROE oranlarını tek istekte çeker."""
     fmap = {}
     try:
         resp = requests.get(
             "https://www.isyatirim.com.tr/_layouts/15/Isyatirim.Website/Common/Data.aspx/HisseSenetleri",
             headers=_HTTP_HEADERS,
-            timeout=10
+            timeout=6
         )
         if resp.status_code == 200:
             for item in (resp.json().get("value") or []):
@@ -449,13 +448,13 @@ def _fetch_isyatirim_fundamental_map():
     return fmap
 
 
-@st.cache_data(ttl=43200, show_spinner="Şirket bilançoları İş Yatırım & finans kaynaklarından kontrol ediliyor...")
+@st.cache_data(ttl=43200, show_spinner="Şirket bilançoları kontrol ediliyor...")
 def get_fund(tickers):
     is_map = _fetch_isyatirim_fundamental_map()
+    target_tickers = list(tickers)[:25]
 
     def one(t):
         base = dict(is_map.get(t, {}))
-        # Eksik kalem varsa Yahoo Finance ile tamamla
         valid_keys = [k for k in ("trailingPE", "priceToBook", "returnOnEquity", "profitMargins", "debtToEquity") if ok_num(base.get(k))]
         if len(valid_keys) >= 3:
             return t, base
@@ -471,7 +470,7 @@ def get_fund(tickers):
         return t, base
 
     with ThreadPoolExecutor(6) as ex:
-        return dict(ex.map(one, tickers[:40]))
+        return dict(ex.map(one, target_tickers))
 
 
 def get_single_stock_data(ticker):
@@ -489,13 +488,13 @@ def get_single_stock_data(ticker):
     if d1d.empty or d15.empty:
         try:
             if d1d.empty:
-                d1d = _normalize_ohlcv(yf.download(t + ".IS", period="1y", interval="1d", progress=False, auto_adjust=False))
+                d1d = _normalize_ohlcv(yf.download(t + ".IS", period="1y", interval="1d", progress=False, auto_adjust=False, timeout=8))
             if d15.empty:
-                d15 = _normalize_ohlcv(yf.download(t + ".IS", period="5d", interval="15m", progress=False, auto_adjust=False))
+                d15 = _normalize_ohlcv(yf.download(t + ".IS", period="5d", interval="15m", progress=False, auto_adjust=False, timeout=8))
         except Exception:
             pass
 
-    info = get_fund([t]).get(t, {})
+    info = get_fund((t,)).get(t, {})
     return t, d1d, d15, info
 
 
@@ -569,10 +568,6 @@ def check_wick_health(row):
 
 
 def apply_live_price_to_df(df, live_price):
-    """
-    Kullanıcının girdiği veya TradingView TA'dan gelen anlık fiyatı serinin son barına işler.
-    Böylece EMA, RSI, VWAP, günlük değişim % ve fitil yapısı anlık fiyata göre baştan hesaplanır!
-    """
     if df is None or df.empty or live_price is None or live_price <= 0:
         return df
     df = df.copy()
@@ -816,7 +811,7 @@ def market_status():
         return "early", "Seans yeni açıldı, fiyatlar çok oynak. Saat 10:15'i beklemek daha sağlıklıdır."
     if hm >= (17, 30):
         return "late", "Borsa kapanmak üzere. Günlük al-sat için yeni işlem açmayın."
-    return "open", "Borsa açık. TradingView & İş Yatırım veri motoru aktif."
+    return "open", "Borsa açık. Hızlı tarama + TradingView & İş Yatırım aktif."
 
 
 def bar(label, v):
@@ -835,14 +830,34 @@ def build_plain_reason(r, is_swing):
     return "💡 <b>Durum Özeti:</b> " + ", ".join(parts) + "."
 
 
+# ---------- Buton Callback Fonksiyonları (Tek Tıkla Anında Çalışır) ----------
+def _cb_apply_live(ticker, inp_key):
+    val = float(st.session_state.get(inp_key, 0.0))
+    live_dict = st.session_state.setdefault("live_prices", {})
+    if val > 0:
+        live_dict[ticker] = val
+    else:
+        live_dict.pop(ticker, None)
+
+
+def _cb_clear_live(ticker, inp_key):
+    st.session_state.setdefault("live_prices", {}).pop(ticker, None)
+    st.session_state[inp_key] = 0.0
+
+
+def _cb_track_trade(mode_name, ticker, entry, stop, t1, t2, lot):
+    add_trade(mode_name, ticker, entry, stop, t1, t2, lot)
+    st.session_state["last_toast"] = f"✅ {ticker} ({tl(entry)} TL) takip listene eklendi!"
+
+
 def card(r, info, frows, mode_name, key_prefix="opp"):
     label, col = verdict(r["Genel"])
     is_swing = "Birkaç Günlük" in mode_name
     sector = info.get("sector") or info.get("industry") or ("Gün İçi Fırsat" if not is_swing else "Orta Vadeli Trend")
     is_live = r.get("IsLive", False)
     card_cls = "card-live" if is_live else "card"
-    live_tag = '<span class="live-badge">⚡ MANUEL ANLIK FİYAT</span>' if is_live else f'<span class="src-badge">📡 {r.get("PriceSource", "TradingView / İş Yatırım")}</span>'
-    price_label = "Manuel Girilen Fiyat" if is_live else f"Fiyat ({r.get('PriceSource', 'TradingView')})"
+    live_tag = '<span class="live-badge">⚡ MANUEL ANLIK FİYAT</span>' if is_live else f'<span class="src-badge">📡 {r.get("PriceSource", "Piyasa Verisi")}</span>'
+    price_label = "Manuel Girilen Fiyat" if is_live else f"Fiyat ({r.get('PriceSource', 'Piyasa')})"
 
     html = (f'<div class="{card_cls}"><div class="top"><div><div class="tk">{r["Hisse"]}{live_tag}</div>'
             f'<div class="sub">{sector} • {price_label}: <b>{tl(r["Fiyat"])} TL</b> (%{r["Değişim"]:+.1f})</div></div>'
@@ -857,9 +872,12 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
-    # --- MANUEL FİYAT GİRİŞİ + TEMİZLE + TAKİBE AL SATIRI ---
+    # --- MANUEL FİYAT GİRİŞİ + TEMİZLE + TAKİBE AL (CALLBACK İLE TEK TIKTA SORUNSUZ ÇALIŞIR) ---
     live_dict = st.session_state.setdefault("live_prices", {})
     inp_key = f"inp_live_{key_prefix}_{mode_name}_{r['Hisse']}"
+    if inp_key not in st.session_state:
+        st.session_state[inp_key] = float(live_dict.get(r["Hisse"], 0.0))
+
     if is_live:
         c_live_in, c_live_btn, c_clear_btn, c_track_btn = st.columns([2.0, 1.35, 0.95, 1.25])
     else:
@@ -867,36 +885,42 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
         c_clear_btn = None
 
     with c_live_in:
-        entered_live = st.number_input(
+        st.number_input(
             f"{r['Hisse']} Anlık Fiyat (TL)",
             min_value=0.0,
-            value=float(live_dict.get(r["Hisse"], 0.0)),
             step=0.05,
             format="%.2f",
             key=inp_key,
             label_visibility="collapsed",
-            help="İstersen aracı kurumundaki anlık fiyatı manuel yazıp tüm teknik puan, stop, hedef ve adedi yeniden hesaplatabilirsin."
+            help="Aracı kurumundaki anlık fiyatı yazıp 'Fiyatı Uygula'ya bas."
         )
     with c_live_btn:
-        if st.button("⚡ Fiyatı Uygula", key=f"btn_live_{key_prefix}_{mode_name}_{r['Hisse']}", use_container_width=True):
-            if entered_live > 0:
-                live_dict[r["Hisse"]] = entered_live
-            else:
-                live_dict.pop(r["Hisse"], None)
-            st.rerun()
+        st.button(
+            "⚡ Fiyatı Uygula",
+            key=f"btn_live_{key_prefix}_{mode_name}_{r['Hisse']}",
+            use_container_width=True,
+            on_click=_cb_apply_live,
+            args=(r["Hisse"], inp_key)
+        )
     if c_clear_btn is not None:
         with c_clear_btn:
-            if st.button("🧹 Temizle", key=f"btn_clr_{key_prefix}_{mode_name}_{r['Hisse']}", use_container_width=True, help="Manuel girilen fiyatı temizle ve otomatik API verisine dön"):
-                live_dict.pop(r["Hisse"], None)
-                if inp_key in st.session_state:
-                    del st.session_state[inp_key]
-                st.rerun()
+            st.button(
+                "🧹 Temizle",
+                key=f"btn_clr_{key_prefix}_{mode_name}_{r['Hisse']}",
+                use_container_width=True,
+                on_click=_cb_clear_live,
+                args=(r["Hisse"], inp_key)
+            )
     with c_track_btn:
-        if st.button("📝 Takibe Al", key=f"log_{key_prefix}_{mode_name}_{r['Hisse']}", use_container_width=True, type="primary"):
-            add_trade(mode_name, r["Hisse"], r["Fiyat"], r["Stop"], r["Hedef1"], r["Hedef2"], r["Lot"])
-            st.toast(f"✅ {r['Hisse']} ({tl(r['Fiyat'])} TL) takip listene eklendi!", icon="📌")
+        st.button(
+            "📝 Takibe Al",
+            key=f"log_{key_prefix}_{mode_name}_{r['Hisse']}",
+            use_container_width=True,
+            type="primary",
+            on_click=_cb_track_trade,
+            args=(mode_name, r["Hisse"], r["Fiyat"], r["Stop"], r["Hedef1"], r["Hedef2"], r["Lot"])
+        )
 
-    # Uyarı / Özet Kutusu
     total_cost = r["Lot"] * r["Fiyat"]
     max_loss = r["Lot"] * r["Risk"]
     est_gain = r["Lot"] * (r["Hedef1"] - r["Fiyat"])
@@ -937,15 +961,16 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
 
 
 # ---------- Arayüz ----------
-active_sources = []
+if "last_toast" in st.session_state:
+    st.toast(st.session_state.pop("last_toast"), icon="📌")
+
+active_sources = ["Hızlı Toplu Tarama", "İş Yatırım Bilanço"]
 if HAS_TV_FEED or HAS_TV_TA:
-    active_sources.append("TradingView Canlı")
-active_sources.append("İş Yatırım")
-active_sources.append("Yahoo Yedek")
+    active_sources.insert(0, "TradingView Canlı")
 
 st.markdown(
     f'<div class="hdr"><h1>📈 BIST Kolay Hisse Tarayıcı</h1>'
-    f'<p>Çok Katmanlı Veri Motoru Aktif: <b>{" + ".join(active_sources)}</b> • Hızlı, kesintisiz ve yüksek doğruluklu BIST taraması.</p></div>',
+    f'<p>Hızlandırılmış Hibrit Veri Motoru: <b>{" + ".join(active_sources)}</b> • Saniyeler içinde tarama ve anlık fiyat analizi.</p></div>',
     unsafe_allow_html=True
 )
 st_autorefresh(interval=10 * 60 * 1000, key="auto")
@@ -981,19 +1006,22 @@ with st.container(border=True):
 
         st.caption(
             f"🔌 **Bağlı Veri Kaynakları:** "
-            f"TradingView Grafik (`tvDatafeed`): **{'Aktif' if HAS_TV_FEED else 'Yüklü Değil (Otomatik Yedek Devrede)'}** • "
-            f"TradingView Anlık (`tradingview-ta`): **{'Aktif' if HAS_TV_TA else 'Yüklü Değil'}** • "
-            f"İş Yatırım Bilanço & Tarihsel Servis: **Aktif**"
+            f"TradingView Grafik (`tvDatafeed`): **{'Aktif' if HAS_TV_FEED else 'Devre Dışı (Hızlı Toplu Motor Aktif)'}** • "
+            f"TradingView Anlık (`tradingview-ta`): **{'Aktif' if HAS_TV_TA else 'Devre Dışı'}** • "
+            f"İş Yatırım Bilanço & Toplu Tarama: **Aktif**"
         )
 
         b_col1, b_col2 = st.columns(2)
         with b_col1:
-            if st.button("🔄 Tüm API Verilerini Şimdi Yenile", use_container_width=True):
+            if st.button("🔄 Tüm Verileri Şimdi Yenile", use_container_width=True):
                 st.cache_data.clear()
                 st.rerun()
         with b_col2:
             if st.button("🧹 Manuel Girilen Fiyatları Temizle", use_container_width=True):
                 st.session_state["live_prices"] = {}
+                for k in list(st.session_state.keys()):
+                    if str(k).startswith("inp_live_"):
+                        st.session_state[k] = 0.0
                 st.rerun()
 
 rv, c_lo, c_hi, r_lo, r_hi, min_tl, min_atr = PROFILES[prof]
@@ -1018,7 +1046,7 @@ dtab = daily_table(daily, min_tl, min_atr, banned_set) if daily else pd.DataFram
 watch = dtab[dtab["Geçti"]]["Hisse"].tolist() if not dtab.empty else []
 
 if "Birkaç Günlük" in mode and watch:
-    top_watch = dtab[dtab["Geçti"]].sort_values("İşlem (M TL)", ascending=False)["Hisse"].tolist()[:40]
+    top_watch = dtab[dtab["Geçti"]].sort_values("İşlem (M TL)", ascending=False)["Hisse"].tolist()[:25]
     fund = get_fund(tuple(top_watch))
     fs = {t: fund_score(fund.get(t, {})) for t in watch}
 else:
@@ -1035,52 +1063,53 @@ tab1, tab2, tab3, tab4 = st.tabs([
 PARA_TXT = {0: "Para girişi zayıf", 1: "Para girişi zayıf", 2: "Para girişi orta", 3: "Para girişi güçlü"}
 
 with tab1:
-    # --- İSTEDİĞİN HİSSEYİ SOR & PLAN OLUŞTUR ---
+    # --- İSTEDİĞİN HİSSEYİ SOR & PLAN OLUŞTUR (FORM İLE TEK TIKTA ÇALIŞIR) ---
     with st.container(border=True):
         st.markdown("#### 🔎 İstediğin Hisse İçin Teknik & Temel Bazlı Plan Oluştur")
-        q1, q2, q3 = st.columns([2.2, 1.8, 1])
-        with q1:
-            custom_ticker = st.text_input("Hisse Kodu (Örn: THYAO)", placeholder="Örn: ASELS").strip().upper()
-        with q2:
-            custom_live_price = st.number_input("Manuel Fiyat (TL) - İsteğe Bağlı", min_value=0.0, value=0.0, step=0.05, format="%.2f",
-                                                help="0 bırakırsan TradingView / İş Yatırım verisini kullanır; özel fiyat yazarsan doğrudan o fiyattan hesaplar.")
-        with q3:
-            st.write("")
-            st.write("")
-            analyze_custom_btn = st.button("🎯 Plan Oluştur", use_container_width=True)
+        with st.form("custom_stock_form", clear_on_submit=False):
+            q1, q2, q3 = st.columns([2.2, 1.8, 1])
+            with q1:
+                custom_ticker_in = st.text_input("Hisse Kodu (Örn: THYAO)", placeholder="Örn: ASELS")
+            with q2:
+                custom_live_price_in = st.number_input("Manuel Fiyat (TL) - İsteğe Bağlı", min_value=0.0, value=0.0, step=0.05, format="%.2f")
+            with q3:
+                st.write("")
+                st.write("")
+                submitted_custom = st.form_submit_button("🎯 Plan Oluştur", use_container_width=True, type="primary")
 
-        if custom_ticker or analyze_custom_btn:
-            if custom_ticker:
-                if custom_live_price > 0:
-                    live_prices[custom_ticker] = custom_live_price
-                effective_live = live_prices.get(custom_ticker)
+        if submitted_custom and custom_ticker_in.strip():
+            st.session_state["active_custom_ticker"] = custom_ticker_in.strip().upper()
+            if custom_live_price_in > 0:
+                live_prices[st.session_state["active_custom_ticker"]] = custom_live_price_in
 
-                with st.spinner(f"{custom_ticker} TradingView & İş Yatırım üzerinden analiz ediliyor..."):
-                    t_clean, d1d_c, d15_c, info_c = get_single_stock_data(custom_ticker)
-                if d1d_c.empty or len(d1d_c) < 55:
-                    st.error(f"❌ '{custom_ticker}' kodu için yeterli BIST verisi bulunamadı.")
+        active_ct = st.session_state.get("active_custom_ticker", "")
+        if active_ct:
+            effective_live = live_prices.get(active_ct)
+            with st.spinner(f"{active_ct} analiz ediliyor..."):
+                t_clean, d1d_c, d15_c, info_c = get_single_stock_data(active_ct)
+            if d1d_c.empty or len(d1d_c) < 55:
+                st.error(f"❌ '{active_ct}' kodu için yeterli BIST verisi bulunamadı.")
+            else:
+                tv_snap_c = get_tv_realtime_snapshot((t_clean,)) if not effective_live else {}
+                auto_live_c = effective_live or tv_snap_c.get(t_clean)
+                src_label_c = "TradingView Canlı" if (not effective_live and tv_snap_c.get(t_clean)) else ("TradingView" if HAS_TV_FEED else "İş Yatırım / Piyasa")
+
+                daily_atr_c = float(atr(d1d_c).iloc[-1])
+                sc_c, _, frows_c = fund_score(info_c)
+                fp_c, _, _, _ = flow(d1d_c)
+                if "Gün İçi" in mode and not d15_c.empty:
+                    item_c = analyze_intraday(t_clean, d15_c, params, daily_atr_c, live_price=auto_live_c, price_source=src_label_c)
                 else:
-                    tv_snap_c = get_tv_realtime_snapshot((t_clean,)) if not effective_live else {}
-                    auto_live_c = effective_live or tv_snap_c.get(t_clean)
-                    src_label_c = "TradingView Canlı" if (not effective_live and tv_snap_c.get(t_clean)) else ("TradingView / İş Yatırım" if HAS_TV_FEED else "İş Yatırım / Yahoo")
+                    item_c = analyze_swing(t_clean, d1d_c, params, daily_atr_c, temel_puan=sc_c, live_price=auto_live_c, price_source=src_label_c)
 
-                    daily_atr_c = float(atr(d1d_c).iloc[-1])
-                    sc_c, _, frows_c = fund_score(info_c)
-                    fp_c, _, _, _ = flow(d1d_c)
-                    if "Gün İçi" in mode and not d15_c.empty:
-                        item_c = analyze_intraday(t_clean, d15_c, params, daily_atr_c, live_price=auto_live_c, price_source=src_label_c)
-                    else:
-                        item_c = analyze_swing(t_clean, d1d_c, params, daily_atr_c, temel_puan=sc_c, live_price=auto_live_c, price_source=src_label_c)
-
-                    if item_c:
-                        # Eğer kullanıcı manuel fiyat girmediyse IsLive rozetini manuel değil API olarak göster
-                        if not effective_live:
-                            item_c["IsLive"] = False
-                        item_c["Temel"] = sc_c
-                        item_c["Para"] = fp_c / 3 * 100
-                        item_c["ParaTxt"] = PARA_TXT[fp_c]
-                        item_c["Genel"] = overall_intraday(item_c["Tek"], item_c["Para"]) if "Gün İçi" in mode else overall_swing(item_c["Tek"], item_c["Temel"], item_c["Para"])
-                        card(item_c, info_c, frows_c, mode, key_prefix="custom")
+                if item_c:
+                    if not effective_live:
+                        item_c["IsLive"] = False
+                    item_c["Temel"] = sc_c
+                    item_c["Para"] = fp_c / 3 * 100
+                    item_c["ParaTxt"] = PARA_TXT[fp_c]
+                    item_c["Genel"] = overall_intraday(item_c["Tek"], item_c["Para"]) if "Gün İçi" in mode else overall_swing(item_c["Tek"], item_c["Temel"], item_c["Para"])
+                    card(item_c, info_c, frows_c, mode, key_prefix="custom")
 
     st.divider()
 
@@ -1091,12 +1120,14 @@ with tab1:
         st.info("Şu an otomatik taramada kriterlere uyan hisse bulunamadı. Yukarıdaki kutudan kendi istediğin hisseyi yazıp analiz edebilirsin.")
     else:
         drow = dtab.set_index("Hisse")
-        tv_snaps = get_tv_realtime_snapshot(tuple(watch[:30]))
-        default_src = "TradingView Canlı" if (HAS_TV_FEED or tv_snaps) else "İş Yatırım / Yahoo"
+        # En likit ilk 20 adaya odaklanarak bekleme süresini minimumda tut
+        candidate_tickers = dtab[dtab["Geçti"]].sort_values("İşlem (M TL)", ascending=False)["Hisse"].tolist()[:20]
+        tv_snaps = get_tv_realtime_snapshot(tuple(candidate_tickers))
+        default_src = "TradingView Canlı" if (HAS_TV_FEED or tv_snaps) else "Piyasa Verisi"
 
         res = []
         if "Gün İçi" in mode:
-            intra = get_intraday(tuple(watch))
+            intra = get_intraday(tuple(candidate_tickers))
             for t, d in intra.items():
                 manual_lp = live_prices.get(t)
                 auto_lp = manual_lp or tv_snaps.get(t)
@@ -1107,7 +1138,7 @@ with tab1:
                         item["IsLive"] = False
                     res.append(item)
         else:
-            for t in watch:
+            for t in candidate_tickers:
                 d = daily.get(t)
                 if d is not None:
                     manual_lp = live_prices.get(t)
@@ -1137,7 +1168,7 @@ with tab1:
             st.info("Bugün otomatik taramada tüm şartları eksiksiz karşılayan fırsat çıkmadı. Yukarıdan kendi hisseni sorgulayabilir veya aşağıdaki izleme listesine bakabilirsin.")
         else:
             st.markdown("#### ✨ Öne Çıkan Fırsatlar")
-            st.caption("💡 Veriler TradingView ve İş Yatırım üzerinden çekilir. Dilersen kartın altından kendi gördüğün anlık fiyatı yazıp simülasyon da yapabilirsin.")
+            st.caption("💡 Kartın altından kendi gördüğün anlık fiyatı yazıp **'⚡ Fiyatı Uygula'** butonuna basabilir veya **'📝 Takibe Al'** ile listene ekleyebilirsin.")
             for x in opp[:6]:
                 t = x["Hisse"]
                 card(x, fund.get(t, {}), fs[t][2], mode, key_prefix="opp")
@@ -1154,35 +1185,37 @@ with tab2:
 
     with st.container(border=True):
         st.markdown("**➕ Takip Listene Doğrudan Hisse Ekle (Otomatik Teknik & Temel Stop/Hedef Hesaplar)**")
-        a1, a2, a3 = st.columns([2, 2, 1])
-        with a1:
-            add_tk = st.text_input("Hisse Kodu (Örn: GARAN)", key="add_tk_input").strip().upper()
-        with a2:
-            custom_entry = st.number_input("Alış Fiyatın (TL) (0 = güncel piyasa fiyatı)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
-        with a3:
-            st.write("")
-            st.write("")
-            if st.button("➕ Hesapla ve Ekle", use_container_width=True, type="primary"):
-                if add_tk:
-                    with st.spinner(f"{add_tk} için teknik ve temel destek/hedefler hesaplanıyor..."):
-                        t_clean, d1d_a, _, info_a = get_single_stock_data(add_tk)
-                    if d1d_a.empty or len(d1d_a) < 30:
-                        st.error("Hisse verisi bulunamadı. Kodu kontrol edin.")
-                    else:
-                        if custom_entry > 0:
-                            d1d_a = apply_live_price_to_df(d1d_a, custom_entry)
-                        daily_atr_a = float(atr(d1d_a).iloc[-1])
-                        sc_a, _, _ = fund_score(info_a)
-                        entry_a = custom_entry if custom_entry > 0 else float(d1d_a["Close"].iloc[-1])
-                        ema20_a = float(ema(d1d_a["Close"], 20).iloc[-1])
-                        recent_low_a = float(d1d_a["Low"].tail(5).min())
-                        raw_sup_a = max(ema20_a, recent_low_a)
-                        if raw_sup_a >= entry_a:
-                            raw_sup_a = entry_a - 0.5 * daily_atr_a
-                        plan_a = compute_smart_plan(entry_a, raw_sup_a, daily_atr_a, capital, risk_pct, sc_a, 75, is_swing=True)
-                        add_trade(mode, t_clean, entry_a, plan_a["stop"], plan_a["target1"], plan_a["target2"], plan_a["lot"])
-                        st.success(f"✅ {t_clean} eklendi! Alış: {tl(entry_a)} TL | Stop: {tl(plan_a['stop'])} TL | 1. Hedef: {tl(plan_a['target1'])} TL")
-                        st.rerun()
+        with st.form("add_trade_form", clear_on_submit=True):
+            a1, a2, a3 = st.columns([2, 2, 1])
+            with a1:
+                add_tk = st.text_input("Hisse Kodu (Örn: GARAN)").strip().upper()
+            with a2:
+                custom_entry = st.number_input("Alış Fiyatın (TL) (0 = güncel piyasa fiyatı)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
+            with a3:
+                st.write("")
+                st.write("")
+                submitted_add = st.form_submit_button("➕ Hesapla ve Ekle", use_container_width=True, type="primary")
+
+        if submitted_add and add_tk:
+            with st.spinner(f"{add_tk} için teknik ve temel destek/hedefler hesaplanıyor..."):
+                t_clean, d1d_a, _, info_a = get_single_stock_data(add_tk)
+            if d1d_a.empty or len(d1d_a) < 30:
+                st.error("Hisse verisi bulunamadı. Kodu kontrol edin.")
+            else:
+                if custom_entry > 0:
+                    d1d_a = apply_live_price_to_df(d1d_a, custom_entry)
+                daily_atr_a = float(atr(d1d_a).iloc[-1])
+                sc_a, _, _ = fund_score(info_a)
+                entry_a = custom_entry if custom_entry > 0 else float(d1d_a["Close"].iloc[-1])
+                ema20_a = float(ema(d1d_a["Close"], 20).iloc[-1])
+                recent_low_a = float(d1d_a["Low"].tail(5).min())
+                raw_sup_a = max(ema20_a, recent_low_a)
+                if raw_sup_a >= entry_a:
+                    raw_sup_a = entry_a - 0.5 * daily_atr_a
+                plan_a = compute_smart_plan(entry_a, raw_sup_a, daily_atr_a, capital, risk_pct, sc_a, 75, is_swing=True)
+                add_trade(mode, t_clean, entry_a, plan_a["stop"], plan_a["target1"], plan_a["target2"], plan_a["lot"])
+                st.session_state["last_toast"] = f"✅ {t_clean} eklendi! Alış: {tl(entry_a)} TL"
+                st.rerun()
 
     tdf = get_trades()
     if tdf.empty:
@@ -1215,60 +1248,62 @@ with tab2:
             status_opts = ["AÇIK", "KÂR İLE KAPATILDI", "ZARAR KES OLDU"]
             cur_status_idx = status_opts.index(cur_row["status"]) if cur_row["status"] in status_opts else 0
 
-            u1, u2, u3, u4 = st.columns(4)
-            with u1:
-                edit_entry = st.number_input(
-                    "Gerçek Alış Fiyatın (TL)",
-                    min_value=0.01,
-                    value=float(cur_row["entry"]),
-                    step=0.05,
-                    format="%.2f",
-                    key=f"edit_entry_{sel_id}"
-                )
-            with u2:
-                edit_lot = st.number_input(
-                    "Aldığın Adet (Lot)",
-                    min_value=1,
-                    value=int(cur_row["lot"]),
-                    step=1,
-                    key=f"edit_lot_{sel_id}"
-                )
-            with u3:
-                new_status = st.selectbox("İşlem Durumu", status_opts, index=cur_status_idx, key=f"edit_status_{sel_id}")
-            with u4:
-                cur_exit = float(cur_row["exit_price"]) if pd.notna(cur_row["exit_price"]) else 0.0
-                exit_p = st.number_input(
-                    "Sattığın Fiyat (TL) (Açık ise 0)",
-                    min_value=0.0,
-                    value=cur_exit,
-                    step=0.05,
-                    format="%.2f",
-                    key=f"edit_exit_{sel_id}"
-                )
-
-            b1, b2 = st.columns([3, 1])
-            with b1:
-                if st.button("💾 Değişiklikleri Kaydet", use_container_width=True, type="primary"):
-                    update_trade_status(
-                        sel_id,
-                        new_status,
-                        exit_p if exit_p > 0 else None,
-                        new_entry=edit_entry,
-                        new_lot=edit_lot
+            with st.form(f"edit_trade_form_{sel_id}"):
+                u1, u2, u3, u4 = st.columns(4)
+                with u1:
+                    edit_entry = st.number_input(
+                        "Gerçek Alış Fiyatın (TL)",
+                        min_value=0.01,
+                        value=float(cur_row["entry"]),
+                        step=0.05,
+                        format="%.2f"
                     )
-                    st.toast(f"✅ #{sel_id} ({cur_row['ticker']}) güncellendi!", icon="💾")
-                    st.rerun()
-            with b2:
-                if st.button("🗑️ İşlemi Sil", use_container_width=True):
-                    delete_trade(sel_id)
-                    st.rerun()
+                with u2:
+                    edit_lot = st.number_input(
+                        "Aldığın Adet (Lot)",
+                        min_value=1,
+                        value=int(cur_row["lot"]),
+                        step=1
+                    )
+                with u3:
+                    new_status = st.selectbox("İşlem Durumu", status_opts, index=cur_status_idx)
+                with u4:
+                    cur_exit = float(cur_row["exit_price"]) if pd.notna(cur_row["exit_price"]) else 0.0
+                    exit_p = st.number_input(
+                        "Sattığın Fiyat (TL) (Açık ise 0)",
+                        min_value=0.0,
+                        value=cur_exit,
+                        step=0.05,
+                        format="%.2f"
+                    )
+
+                b1, b2 = st.columns([3, 1])
+                with b1:
+                    save_clicked = st.form_submit_button("💾 Değişiklikleri Kaydet", use_container_width=True, type="primary")
+                with b2:
+                    delete_clicked = st.form_submit_button("🗑️ İşlemi Sil", use_container_width=True)
+
+            if save_clicked:
+                update_trade_status(
+                    sel_id,
+                    new_status,
+                    exit_p if exit_p > 0 else None,
+                    new_entry=edit_entry,
+                    new_lot=edit_lot
+                )
+                st.session_state["last_toast"] = f"✅ #{sel_id} ({cur_row['ticker']}) güncellendi!"
+                st.rerun()
+            if delete_clicked:
+                delete_trade(sel_id)
+                st.session_state["last_toast"] = f"🗑️ #{sel_id} ({cur_row['ticker']}) silindi."
+                st.rerun()
 
 with tab3:
     st.markdown("""
 ### 👋 Hiç Bilmeyenler İçin 4 Adımda Kullanım Rehberi
 
 1. **Bütçeni ve Süreni Seç:** Üst kutudan borsaya ayırdığın parayı yaz. Yeni başlıyorsan **"Birkaç Günlük / Haftalık"** modunu seç.
-2. **Çok Katmanlı Canlı Veri Motoru:** Uygulama fiyat ve grafikleri **TradingView** ile **İş Yatırım** üzerinden otomatik çeker (erişim kısıtı olursa yedek olarak Yahoo Finance devreye girer). İstersen kartların altındaki kutudan kendi anlık fiyatını yazıp simülasyon da yapabilirsin.
+2. **Hızlı Tarama & Canlı Veri:** Uygulama 500+ BIST hissesini saniyeler içinde eler, öne çıkan adayların anlık fiyat ve bilanço verilerini **TradingView** ile **İş Yatırım** üzerinden tamamlar.
 3. **'📝 Takibe Al' ve Gerçek Alış Fiyatını Düzenle:** İşlemi aldıktan sonra **Takip Listem & İşlemlerim** sekmesinden gerçek alış fiyatını ve adetini düzenleyebilirsin.
 4. **Önce Stop, Sonra Hedef:** Alım yaptıktan sonra mutlaka tabloda yazan **Zarar Kes (Stop)** seviyesine satış emri gir.
 """)
