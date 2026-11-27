@@ -38,10 +38,12 @@ st.markdown("""<style>
 .hdr h1{margin:0;font-size:1.55rem;color:#fff;padding:0}
 .hdr p{margin:6px 0 0;opacity:.85;font-size:.9rem}
 .card{border:1px solid rgba(128,128,128,.25);border-radius:16px;padding:18px 20px;margin:14px 0 8px;background:rgba(128,128,128,.05)}
+.card-live{border:2px solid #16a34a;border-radius:16px;padding:18px 20px;margin:14px 0 8px;background:rgba(22,163,74,.05)}
 .top{display:flex;justify-content:space-between;align-items:center;gap:10px}
 .tk{font-size:1.6rem;font-weight:800;letter-spacing:.5px}
 .sub{opacity:.75;font-size:.85rem;margin-top:2px}
 .pill{padding:6px 14px;border-radius:999px;font-weight:700;font-size:.82rem;color:#fff;white-space:nowrap}
+.live-badge{display:inline-block;padding:2px 8px;border-radius:6px;background:#16a34a;color:#fff;font-size:.72rem;font-weight:700;margin-left:8px;vertical-align:middle}
 .summary-box{margin:12px 0;padding:10px 14px;border-radius:10px;background:rgba(37,99,235,.08);font-size:.88rem;line-height:1.45}
 .grid{display:grid;grid-template-columns:repeat(2,1fr);gap:10px;margin-top:12px}
 @media(min-width:650px){.grid{grid-template-columns:repeat(4,1fr)}}
@@ -251,7 +253,6 @@ def get_fund(tickers):
 
 
 def get_single_stock_data(ticker):
-    """Manuel aranan tek hisse için hem günlük hem 15dk veri ve bilanço getirir."""
     t = ticker.strip().upper().replace(".IS", "")
     try:
         d1d = yf.download(t + ".IS", period="1y", interval="1d", progress=False, auto_adjust=False).dropna(subset=["Close"])
@@ -339,41 +340,48 @@ def check_wick_health(row):
     return wick_ratio <= 0.45, wick_ratio * 100
 
 
+def apply_live_price_to_df(df, live_price):
+    """
+    Kullanıcının aracı kurumundan girip yazdığı anlık fiyatı serinin son barına işler.
+    Böylece EMA, RSI, VWAP, günlük değişim % ve fitil yapısı anlık fiyata göre baştan hesaplanır!
+    """
+    if df is None or df.empty or live_price is None or live_price <= 0:
+        return df
+    df = df.copy()
+    idx = df.index[-1]
+    df.loc[idx, "Close"] = float(live_price)
+    if live_price > float(df.loc[idx, "High"]):
+        df.loc[idx, "High"] = float(live_price)
+    if live_price < float(df.loc[idx, "Low"]):
+        df.loc[idx, "Low"] = float(live_price)
+    return df
+
+
 def compute_smart_plan(entry, raw_support, daily_atr, capital, risk_pct, temel_puan, tek_puan, is_swing):
-    """
-    Tekniğe VE Temele dayalı dinamik Stop, Hedef ve Adet (Lot) hesaplayıcı.
-    - Teknik: Destek seviyesi (EMA20 / VWAP / Gün dibi) + ATR oynaklık payı.
-    - Temel: Bilanço sağlamsa (Temel >= 65) hisseye biraz daha nefes payı ve daha yüksek hedef çarpanı tanır;
-             bilanço zayıfsa (< 45) stopu sıkılaştırır, hedefi daha temkinli (kısa) tutar.
-    """
-    # Temel bazlı çarpanlar
     if is_swing and temel_puan is not None:
         if temel_puan >= 65:
-            atr_buffer = 0.65       # Güçlü şirkette sahte silkelemeye yakalanmamak için biraz daha geniş nefes payı
-            rr1, rr2 = 2.2, 3.8     # Güçlü bilanço trendi daha uzağa taşır
+            atr_buffer = 0.65
+            rr1, rr2 = 2.2, 3.8
             plan_note = f"Bilanço güçlü ({temel_puan}/100): Silkelemelere karşı destek payı korundu, hedefler genişletildi."
         elif temel_puan >= 45:
             atr_buffer = 0.50
             rr1, rr2 = 1.8, 3.0
             plan_note = f"Bilanço orta ({temel_puan}/100): Standart teknik destek ve kâr hedefleri uygulandı."
         else:
-            atr_buffer = 0.35       # Zayıf bilançoda kârı erken al, stopu yakın tut
+            atr_buffer = 0.35
             rr1, rr2 = 1.4, 2.2
             plan_note = f"Bilanço zayıf ({temel_puan}/100): Riski sınırlamak için stop sıkılaştırıldı, hedefler yakın tutuldu."
     else:
-        # Gün içi veya temel veri yoksa saf teknik + momentum gücü
         atr_buffer = 0.30 if not is_swing else 0.50
         rr1 = 1.6 if tek_puan >= 80 else 1.4
         rr2 = 2.6 if tek_puan >= 80 else 2.2
         plan_note = "Teknik destek (EMA/VWAP) ve günlük oynaklık (ATR) baz alınarak hesaplandı."
 
     stop = raw_support - atr_buffer * daily_atr
-    # Stop hiçbir zaman giriş fiyatının üstünde veya aşırı yakın olamaz
     min_stop_dist = 0.35 * daily_atr
     if (entry - stop) < min_stop_dist:
         stop = entry - min_stop_dist
 
-    # Stop maksimum sınırı (Aşırı geniş stopları kırp ki 'Takibe Al' tuşu her zaman çalışsın, risk kontrol altında kalsın)
     max_stop_dist = (1.8 * daily_atr) if is_swing else (0.9 * daily_atr)
     is_wide_warning = False
     if (entry - stop) > max_stop_dist:
@@ -384,7 +392,6 @@ def compute_smart_plan(entry, raw_support, daily_atr, capital, risk_pct, temel_p
     target1 = entry + rr1 * risk
     target2 = entry + rr2 * risk
 
-    # Risk yönetimine göre ideal adet (lot) hesabı (en az 1 adet)
     max_tl_risk = capital * (risk_pct / 100.0)
     raw_lot = min(max_tl_risk / risk, (capital * 0.40) / entry)
     lot = max(1, int(raw_lot))
@@ -402,8 +409,13 @@ def compute_smart_plan(entry, raw_support, daily_atr, capital, risk_pct, temel_p
     }
 
 
-def analyze_intraday(t, d, p, daily_atr):
-    d = d.copy()
+def analyze_intraday(t, d, p, daily_atr, live_price=None):
+    is_live = live_price is not None and live_price > 0
+    if is_live:
+        d = apply_live_price_to_df(d, live_price)
+    else:
+        d = d.copy()
+
     d["day"] = d.index.date
     last_day = d["day"].iloc[-1]
     tp = (d["High"] + d["Low"] + d["Close"]) / 3
@@ -424,10 +436,10 @@ def analyze_intraday(t, d, p, daily_atr):
     wick_ok, _ = check_wick_health(r)
 
     checks = [
-        ("Fiyat gün içi ortalamanın (VWAP) üzerinde güçlü duruyor", bool(r["Close"] > r["vwap"])),
+        (f"Fiyat gün içi ortalamanın ({tl(r['vwap'])} TL) üzerinde güçlü duruyor", bool(r["Close"] > r["vwap"])),
         ("Kısa vadeli yükseliş trendi aktif (EMA9 > EMA20)", bool(r["ema9"] > r["ema20"] and r["Close"] > r["ema20"])),
         (f"Fiyat henüz aşırı şişmemiş (Bugün %{chg:+.1f})", bool(p["chg_lo"] <= chg <= p["chg_hi"])),
-        ("Alım iştahı dengeli (Aşırı alım bölgesinde değil)", bool(p["rsi_lo"] <= r["rsi"] <= p["rsi_hi"])),
+        (f"Alım iştahı dengeli (RSI {r['rsi']:.0f})", bool(p["rsi_lo"] <= r["rsi"] <= p["rsi_hi"])),
         ("Hisseye normalin üzerinde işlem hacmi giriyor", bool(rvol >= p["rvol"])),
         ("Tepeden sert satış baskısı (fitil) yok", wick_ok),
     ]
@@ -445,14 +457,19 @@ def analyze_intraday(t, d, p, daily_atr):
         "Puan": puan, "Toplam": toplam, "Tek": tek,
         "Stop": plan["stop"], "Risk": plan["risk"], "Hedef1": plan["target1"], "Hedef2": plan["target2"],
         "Lot": plan["lot"], "IsWide": plan["is_wide"], "PlanNote": plan["plan_note"],
-        "_ts": d.index[-1], "RVOL": rvol
+        "IsLive": is_live, "_ts": d.index[-1], "RVOL": rvol
     }
 
 
-def analyze_swing(t, d, p, daily_atr, temel_puan=None):
+def analyze_swing(t, d, p, daily_atr, temel_puan=None, live_price=None):
     if len(d) < 55:
         return None
-    d = d.copy()
+    is_live = live_price is not None and live_price > 0
+    if is_live:
+        d = apply_live_price_to_df(d, live_price)
+    else:
+        d = d.copy()
+
     d["ema20"] = ema(d["Close"], 20)
     d["ema50"] = ema(d["Close"], 50)
     d["rsi"] = rsi(d["Close"])
@@ -473,7 +490,6 @@ def analyze_swing(t, d, p, daily_atr, temel_puan=None):
     ]
 
     entry = float(r["Close"])
-    # Teknik destek: EMA20 veya son 5 günün en düşük seviyesi (hangisi fiyata daha yakınsa)
     recent_low = float(d["Low"].tail(5).min())
     raw_support = max(float(r["ema20"]), recent_low)
     puan = sum(ok for _, ok in checks)
@@ -487,7 +503,7 @@ def analyze_swing(t, d, p, daily_atr, temel_puan=None):
         "Puan": puan, "Toplam": toplam, "Tek": tek,
         "Stop": plan["stop"], "Risk": plan["risk"], "Hedef1": plan["target1"], "Hedef2": plan["target2"],
         "Lot": plan["lot"], "IsWide": plan["is_wide"], "PlanNote": plan["plan_note"],
-        "_ts": d.index[-1], "RVOL": rvol
+        "IsLive": is_live, "_ts": d.index[-1], "RVOL": rvol
     }
 
 
@@ -580,7 +596,7 @@ def bar(label, v):
 
 
 def build_plain_reason(r, is_swing):
-    parts = [f"Hisse bugün <b>%{r['Değişim']:+.1f}</b> hareketle yükseliş eğiliminde"]
+    parts = [f"Hisse <b>%{r['Değişim']:+.1f}</b> hareketle yükseliş eğiliminde"]
     if r.get("Para", 0) >= 66:
         parts.append("hisseye belirgin bir <b>para girişi</b> var")
     if is_swing and r.get("Temel") is not None:
@@ -595,9 +611,13 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
     label, col = verdict(r["Genel"])
     is_swing = "Birkaç Günlük" in mode_name
     sector = info.get("sector") or info.get("industry") or ("Gün İçi Fırsat" if not is_swing else "Orta Vadeli Trend")
+    is_live = r.get("IsLive", False)
+    card_cls = "card-live" if is_live else "card"
+    live_tag = '<span class="live-badge">⚡ ANLIK FİYATLA GÜNCELLENDİ</span>' if is_live else ""
+    price_label = "Anlık Girilen Fiyat" if is_live else "Gecikmeli Fiyat (~15 dk)"
 
-    html = (f'<div class="card"><div class="top"><div><div class="tk">{r["Hisse"]}</div>'
-            f'<div class="sub">{sector} • Güncel Fiyat: <b>{tl(r["Fiyat"])} TL</b> (Bugün %{r["Değişim"]:+.1f})</div></div>'
+    html = (f'<div class="{card_cls}"><div class="top"><div><div class="tk">{r["Hisse"]}{live_tag}</div>'
+            f'<div class="sub">{sector} • {price_label}: <b>{tl(r["Fiyat"])} TL</b> (%{r["Değişim"]:+.1f})</div></div>'
             f'<div class="pill" style="background:{col}">{label} • {r["Genel"]:.0f}/100</div></div>'
             f'<div class="summary-box">{build_plain_reason(r, is_swing)}<br><small style="opacity:.8">📐 <b>Plan Mantığı:</b> {r["PlanNote"]}</small></div>')
 
@@ -609,37 +629,63 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
     html += "</div>"
     st.markdown(html, unsafe_allow_html=True)
 
-    c_info, c_btn = st.columns([3.8, 1.3])
-    with c_info:
-        total_cost = r["Lot"] * r["Fiyat"]
-        max_loss = r["Lot"] * r["Risk"]
-        est_gain = r["Lot"] * (r["Hedef1"] - r["Fiyat"])
-        if r.get("IsWide"):
-            st.warning(
-                f"⚠️ **Oynaklık Yüksek:** Önerilen **{r['Lot']} adet** (~**{tl(total_cost)} TL**) • "
-                f"Stop kaybı: **{tl(max_loss)} TL** • 1. hedef kârı: **{tl(est_gain)} TL**."
-            )
-        else:
-            st.success(
-                f"📌 **Önerilen Alım:** **{r['Lot']} adet** (Yaklaşık **{tl(total_cost)} TL**) • "
-                f"Stop olursa kayıp: **{tl(max_loss)} TL** • "
-                f"1. hedefte kâr: **{tl(est_gain)} TL**."
-            )
-
-    with c_btn:
-        # TAKİBE AL TUŞU ARTIK HER KARTTA GARANTİLİ OLARAK GÖRÜNÜR
+    # --- CANLI FİYAT GİRİŞİ + TAKİBE AL SATIRI ---
+    live_dict = st.session_state.setdefault("live_prices", {})
+    c_live_in, c_live_btn, c_track_btn = st.columns([2.2, 1.3, 1.3])
+    with c_live_in:
+        entered_live = st.number_input(
+            f"{r['Hisse']} Anlık Fiyat (TL)",
+            min_value=0.0,
+            value=float(live_dict.get(r["Hisse"], 0.0)),
+            step=0.05,
+            format="%.2f",
+            key=f"inp_live_{key_prefix}_{mode_name}_{r['Hisse']}",
+            label_visibility="collapsed",
+            help="Aracı kurumundan gördüğün anlık fiyatı yazıp 'Fiyatı Uygula'ya bas; tüm teknik puan, stop, hedef ve adet anında yeniden hesaplansın."
+        )
+    with c_live_btn:
+        if st.button("⚡ Anlık Fiyatı Uygula", key=f"btn_live_{key_prefix}_{mode_name}_{r['Hisse']}", use_container_width=True):
+            if entered_live > 0:
+                live_dict[r["Hisse"]] = entered_live
+            else:
+                live_dict.pop(r["Hisse"], None)
+            st.rerun()
+    with c_track_btn:
         if st.button("📝 Takibe Al", key=f"log_{key_prefix}_{mode_name}_{r['Hisse']}", use_container_width=True, type="primary"):
             add_trade(mode_name, r["Hisse"], r["Fiyat"], r["Stop"], r["Hedef1"], r["Hedef2"], r["Lot"])
-            st.toast(f"✅ {r['Hisse']} takip listene ('İşlemlerim' sekmesine) eklendi!", icon="📌")
+            st.toast(f"✅ {r['Hisse']} ({tl(r['Fiyat'])} TL) takip listene eklendi!", icon="📌")
+
+    # Uyarı / Özet Kutusu
+    total_cost = r["Lot"] * r["Fiyat"]
+    max_loss = r["Lot"] * r["Risk"]
+    est_gain = r["Lot"] * (r["Hedef1"] - r["Fiyat"])
+
+    if r["Puan"] < r["Toplam"] and is_live:
+        failed_checks = [l for l, ok in r["Kontroller"] if not ok]
+        st.error(
+            f"🚨 **Anlık Fiyat Uyarısı:** Girdiğin **{tl(r['Fiyat'])} TL** fiyatıyla bu hisse **{len(failed_checks)} teknik kuralı bozdu!** "
+            f"(Bozulan: *{failed_checks[0]}*). Alım yapmadan önce tekrar düşün."
+        )
+    elif r.get("IsWide"):
+        st.warning(
+            f"⚠️ **Oynaklık Yüksek:** Önerilen **{r['Lot']} adet** (~**{tl(total_cost)} TL**) • "
+            f"Stop kaybı: **{tl(max_loss)} TL** • 1. hedef kârı: **{tl(est_gain)} TL**."
+        )
+    else:
+        st.success(
+            f"📌 **Önerilen Alım:** **{r['Lot']} adet** (Yaklaşık **{tl(total_cost)} TL**) • "
+            f"Stop olursa kayıp: **{tl(max_loss)} TL** • "
+            f"1. hedefte kâr: **{tl(est_gain)} TL**."
+        )
 
     with st.expander(f"🔍 {r['Hisse']} Teknik ve Bilanço Detaylarını Gör"):
         bars_html = bar("Grafik Gücü", r["Tek"]) + bar("Para Girişi", r["Para"])
         if is_swing and r.get("Temel") is not None:
             bars_html += bar("Bilanço Sağlamlığı", r["Temel"])
         st.markdown(bars_html, unsafe_allow_html=True)
-        st.markdown("**Kontrol Listesi:**")
+        st.markdown("**Kontrol Listesi (Anlık fiyata göre güncel):**")
         for l, ok in r["Kontroller"]:
-            st.write(("✅ " if ok else "⬜ ") + l)
+            st.write(("✅ " if ok else "❌ ") + l)
         if is_swing and frows:
             st.markdown("**Şirket Bilanço Özeti:**")
             for n, v, rule, good in frows:
@@ -649,10 +695,12 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
 # ---------- Arayüz ----------
 st.markdown(
     '<div class="hdr"><h1>📈 BIST Kolay Hisse Tarayıcı</h1>'
-    '<p>İster otomatik taranan fırsatları gör, ister kendi istediğin hisseyi yazıp teknik & temel bazlı Stop/Hedef planı çıkar.</p></div>',
+    '<p>Filtrelenen hisselerin aracı kurumundaki anlık fiyatını gir; sistem tüm teknik göstergeleri, puanı, stop ve hedefleri anında yeniden hesaplasın.</p></div>',
     unsafe_allow_html=True
 )
 st_autorefresh(interval=15 * 60 * 1000, key="auto")
+
+live_prices = st.session_state.setdefault("live_prices", {})
 
 # Ana Ekranda Sade 3 Adımlı Ayar Alanı
 with st.container(border=True):
@@ -668,7 +716,7 @@ with st.container(border=True):
     with col3:
         prof = st.selectbox("Risk Tercihin Nedir?", list(PROFILES), index=1)
 
-    with st.expander("🛠️ Gelişmiş Ayarlar (İsteğe Bağlı)"):
+    with st.expander("🛠️ Gelişmiş Ayarlar & Anlık Fiyatları Sıfırla"):
         adv1, adv2, adv3 = st.columns(3)
         with adv1:
             risk_pct = st.slider("Tek işlemde göze alınan maks. zarar (%)", 0.5, 2.5, 1.0, 0.25)
@@ -680,9 +728,16 @@ with st.container(border=True):
         banned_input = st.text_input("Yasaklı / Brüt Takas Hisseleri (Otomatik hariç tutulur)",
                                      value=", ".join(sorted(DEFAULT_BANNED)))
         banned_set = {x.strip().upper() for x in banned_input.replace(",", " ").split() if x.strip()}
-        if st.button("🔄 Verileri Şimdi Güncelle"):
-            st.cache_data.clear()
-            st.rerun()
+
+        b_col1, b_col2 = st.columns(2)
+        with b_col1:
+            if st.button("🔄 Borsa Verilerini Yenile", use_container_width=True):
+                st.cache_data.clear()
+                st.rerun()
+        with b_col2:
+            if st.button("🧹 Girilen Anlık Fiyatları Temizle", use_container_width=True):
+                st.session_state["live_prices"] = {}
+                st.rerun()
 
 rv, c_lo, c_hi, r_lo, r_hi, min_tl, min_atr = PROFILES[prof]
 params = dict(capital=capital, risk_pct=risk_pct, rvol=rv, chg_lo=c_lo, chg_hi=c_hi, rsi_lo=r_lo, rsi_hi=r_hi)
@@ -713,7 +768,6 @@ else:
     fund = {}
     fs = {t: (None, 0, []) for t in watch}
 
-# 4 Sekme
 tab1, tab2, tab3, tab4 = st.tabs([
     "🎯 Günün Fırsatları",
     "📒 Takip Listem & İşlemlerim",
@@ -724,31 +778,38 @@ tab1, tab2, tab3, tab4 = st.tabs([
 PARA_TXT = {0: "Para girişi zayıf", 1: "Para girişi zayıf", 2: "Para girişi orta", 3: "Para girişi güçlü"}
 
 with tab1:
-    # --- YENİ: İSTEDİĞİN HİSSEYİ SOR & STOP/HEDEF OLUŞTUR ---
+    # --- İSTEDİĞİN HİSSEYİ SOR & ANLIK FİYATLA HESAPLA ---
     with st.container(border=True):
         st.markdown("#### 🔎 İstediğin Hisse İçin Teknik & Temel Bazlı Plan Oluştur")
-        q1, q2 = st.columns([3, 1])
+        q1, q2, q3 = st.columns([2.2, 1.8, 1])
         with q1:
-            custom_ticker = st.text_input("Hisse Kodu Yaz (Örn: THYAO, ASELS, EREGL, TUPRS)", placeholder="Hisse kodunu yazıp Enter'a basın veya butona tıklayın...").strip().upper()
+            custom_ticker = st.text_input("Hisse Kodu (Örn: THYAO)", placeholder="Örn: ASELS").strip().upper()
         with q2:
+            custom_live_price = st.number_input("Anlık Fiyat (TL) - İsteğe Bağlı", min_value=0.0, value=0.0, step=0.05, format="%.2f",
+                                                help="0 bırakırsan gecikmeli veriyi kullanır; anlık fiyat yazarsan doğrudan o fiyattan hesaplar.")
+        with q3:
             st.write("")
             st.write("")
             analyze_custom_btn = st.button("🎯 Plan Oluştur", use_container_width=True)
 
         if custom_ticker or analyze_custom_btn:
             if custom_ticker:
-                with st.spinner(f"{custom_ticker} için teknik ve temel veriler analiz ediliyor..."):
+                if custom_live_price > 0:
+                    live_prices[custom_ticker] = custom_live_price
+                effective_live = live_prices.get(custom_ticker)
+
+                with st.spinner(f"{custom_ticker} analiz ediliyor..."):
                     t_clean, d1d_c, d15_c, info_c = get_single_stock_data(custom_ticker)
                 if d1d_c.empty or len(d1d_c) < 55:
-                    st.error(f"❌ '{custom_ticker}' kodu için yeterli BIST verisi bulunamadı. Kodu doğru yazdığınızdan emin olun (Örn: THYAO).")
+                    st.error(f"❌ '{custom_ticker}' kodu için yeterli BIST verisi bulunamadı.")
                 else:
                     daily_atr_c = float(atr(d1d_c).iloc[-1])
                     sc_c, _, frows_c = fund_score(info_c)
                     fp_c, _, _, _ = flow(d1d_c)
                     if "Gün İçi" in mode and not d15_c.empty:
-                        item_c = analyze_intraday(t_clean, d15_c, params, daily_atr_c)
+                        item_c = analyze_intraday(t_clean, d15_c, params, daily_atr_c, live_price=effective_live)
                     else:
-                        item_c = analyze_swing(t_clean, d1d_c, params, daily_atr_c, temel_puan=sc_c)
+                        item_c = analyze_swing(t_clean, d1d_c, params, daily_atr_c, temel_puan=sc_c, live_price=effective_live)
 
                     if item_c:
                         item_c["Temel"] = sc_c
@@ -770,15 +831,17 @@ with tab1:
         if "Gün İçi" in mode:
             intra = get_intraday(tuple(watch))
             for t, d in intra.items():
-                item = analyze_intraday(t, d, params, float(drow.loc[t, "DailyATR"]))
+                lp = live_prices.get(t)
+                item = analyze_intraday(t, d, params, float(drow.loc[t, "DailyATR"]), live_price=lp)
                 if item:
                     res.append(item)
         else:
             for t in watch:
                 d = daily.get(t)
                 if d is not None:
+                    lp = live_prices.get(t)
                     sc_t = fs[t][0]
-                    item = analyze_swing(t, d, params, float(drow.loc[t, "DailyATR"]), temel_puan=sc_t)
+                    item = analyze_swing(t, d, params, float(drow.loc[t, "DailyATR"]), temel_puan=sc_t, live_price=lp)
                     if item:
                         res.append(item)
 
@@ -791,19 +854,22 @@ with tab1:
             x["Genel"] = overall_intraday(x["Tek"], x["Para"]) if "Gün İçi" in mode else overall_swing(x["Tek"], x["Temel"], x["Para"])
 
         okt = lambda x: min_temel == 0 or (x["Temel"] is not None and x["Temel"] >= min_temel)
-        opp = sorted([x for x in res if x["Puan"] == x["Toplam"] and okt(x)], key=lambda x: -x["Genel"])
-        near = sorted([x for x in res if x["Puan"] == x["Toplam"] - 1 and okt(x)], key=lambda x: -x["Genel"])
+
+        # Anlık fiyat girilmiş hisseleri (puanı düşse bile) kullanıcının görebilmesi için listede tut!
+        opp = sorted([x for x in res if (x["Puan"] == x["Toplam"] or x["IsLive"]) and okt(x)], key=lambda x: (-int(x["IsLive"]), -x["Genel"]))
+        near = sorted([x for x in res if x["Puan"] == x["Toplam"] - 1 and not x["IsLive"] and okt(x)], key=lambda x: -x["Genel"])
 
         if not opp:
             st.info("Bugün otomatik taramada tüm şartları eksiksiz karşılayan fırsat çıkmadı. Yukarıdan kendi hisseni sorgulayabilir veya aşağıdaki izleme listesine bakabilirsin.")
         else:
-            st.markdown(f"#### ✨ Otomatik Taramada Öne Çıkan En Güçlü {min(len(opp), 5)} Fırsat")
-            for x in opp[:5]:
+            st.markdown(f"#### ✨ Öne Çıkan Fırsatlar (Anlık Fiyat Girip Yeniden Hesaplatabilirsin)")
+            st.caption("💡 Kartın altındaki kutuya aracı kurumundan gördüğün **anlık fiyatı** yazıp **'⚡ Anlık Fiyatı Uygula'** butonuna basarsan; RSI, ortalamalar, puan, stop, hedef ve adet anında güncellenir.")
+            for x in opp[:6]:
                 t = x["Hisse"]
                 card(x, fund.get(t, {}), fs[t][2], mode, key_prefix="opp")
 
         if near:
-            st.markdown(f"#### 👀 İzleme Listesi ({len(near)} hisse - 1 şartı eksik, takibe alabilirsin)")
+            st.markdown(f"#### 👀 İzleme Listesi ({len(near)} hisse - 1 şartı eksik, anlık fiyatını girip test edebilirsin)")
             for x in near[:5]:
                 t = x["Hisse"]
                 card(x, fund.get(t, {}), fs[t][2], mode, key_prefix="near")
@@ -812,14 +878,13 @@ with tab2:
     st.subheader("📒 Takibe Aldığım Hisseler & İşlemlerim")
     st.write("Günün Fırsatları sekmesinden **'📝 Takibe Al'** dediğinde hisseler, teknik & temel bazlı Stop/Hedef seviyeleriyle buraya kaydedilir.")
 
-    # --- YENİ: TAKİP LİSTESİNE DOĞRUDAN HİSSE EKLEME KUTUSU ---
     with st.container(border=True):
         st.markdown("**➕ Takip Listene Doğrudan Hisse Ekle (Otomatik Teknik & Temel Stop/Hedef Hesaplar)**")
         a1, a2, a3 = st.columns([2, 2, 1])
         with a1:
             add_tk = st.text_input("Hisse Kodu (Örn: GARAN)", key="add_tk_input").strip().upper()
         with a2:
-            custom_entry = st.number_input("Alış Maliyetin (0 bırakırsan güncel fiyatı alır)", min_value=0.0, value=0.0, step=0.1)
+            custom_entry = st.number_input("Anlık / Alış Fiyatın (TL) (0 = gecikmeli son fiyat)", min_value=0.0, value=0.0, step=0.05, format="%.2f")
         with a3:
             st.write("")
             st.write("")
@@ -830,6 +895,8 @@ with tab2:
                     if d1d_a.empty or len(d1d_a) < 30:
                         st.error("Hisse verisi bulunamadı. Kodu kontrol edin.")
                     else:
+                        if custom_entry > 0:
+                            d1d_a = apply_live_price_to_df(d1d_a, custom_entry)
                         daily_atr_a = float(atr(d1d_a).iloc[-1])
                         sc_a, _, _ = fund_score(info_a)
                         entry_a = custom_entry if custom_entry > 0 else float(d1d_a["Close"].iloc[-1])
@@ -845,7 +912,7 @@ with tab2:
 
     tdf = get_trades()
     if tdf.empty:
-        st.info("Henüz takip listende bir hisse yok. Yukarıdan hisse kodu yazıp ekleyebilir veya 'Günün Fırsatları' sekmesindeki '📝 Takibe Al' butonunu kullanabilirsin.")
+        st.info("Henüz takip listende bir hisse yok.")
     else:
         closed = tdf[tdf["status"] != "AÇIK"]
         c1, c2, c3, c4 = st.columns(4)
@@ -890,9 +957,12 @@ with tab3:
 ### 👋 Hiç Bilmeyenler İçin 4 Adımda Kullanım Rehberi
 
 1. **Bütçeni ve Süreni Seç:** Üst kutudan borsaya ayırdığın parayı yaz. Yeni başlıyorsan **"Birkaç Günlük / Haftalık"** modunu seç.
-2. **İster Seçilenleri Gör, İster Kendi Hisseni Yaz:** "Günün Fırsatları" sekmesinde hem sistemin bulduğu hisseleri görebilir hem de arama kutusuna istediğin hisseyi yazıp teknik + bilanço bazlı Stop ve Hedef seviyelerini çıkarabilirsin.
-3. **'📝 Takibe Al' Butonuna Bas:** Beğendiğin hisseyi tek tuşla **Takip Listem & İşlemlerim** sekmesine kaydet.
-4. **Önce Stop, Sonra Hedef:** Aracı kurum uygulamandan alım yaptıktan sonra mutlaka tabloda yazan **Zarar Kes (Stop)** seviyesine satış emri gir.
+2. **Anlık Fiyatı Gir ve Yeniden Hesaplat:** Ücretsiz veriler 15 dakika gecikmelidir. Sistemin bulduğu hissenin altındaki kutuya banka/aracı kurum uygulamanda gördüğün **anlık fiyatı** yaz ve **"⚡ Anlık Fiyatı Uygula"** butonuna bas. Sistem yeni fiyata göre:
+   * Hissenin aşırı yükselip yükselmediğini (`RSI` ve günlük `%` değişimi) tekrar kontrol eder,
+   * Ortalamaların (`EMA`, `VWAP`) üzerinde kalıp kalmadığını yeniden ölçer,
+   * Yeni **Stop**, **1. Hedef**, **2. Hedef** ve **Adet (Lot)** miktarını anında günceller.
+3. **'📝 Takibe Al' Butonuna Bas:** Şartlar hâlâ uygunsa tek tuşla **Takip Listem & İşlemlerim** sekmesine kaydet.
+4. **Önce Stop, Sonra Hedef:** Alım yaptıktan sonra mutlaka tabloda yazan **Zarar Kes (Stop)** seviyesine satış emri gir.
 """)
 
 with tab4:
