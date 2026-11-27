@@ -373,9 +373,10 @@ def get_intraday(tickers):
 
 @st.cache_data(ttl=120)
 def get_tv_realtime_snapshot(tickers):
-    """Filtreden geçen aday hisselerin TradingView anlık fiyatını çeker."""
+    """Filtreden geçen aday hisselerin TradingView anlık fiyatını ve çekilme saatini döndürür."""
+    fetched_at = pd.Timestamp.now(TZ).strftime("%H:%M")
     if not HAS_TV_TA or not tickers:
-        return {}
+        return {}, fetched_at
 
     def one(t):
         try:
@@ -398,7 +399,7 @@ def get_tv_realtime_snapshot(tickers):
         for t, price in ex.map(one, list(tickers)[:20]):
             if price is not None:
                 snaps[t] = price
-    return snaps
+    return snaps, fetched_at
 
 
 @st.cache_data(ttl=240)
@@ -632,7 +633,20 @@ def compute_smart_plan(entry, raw_support, daily_atr, capital, risk_pct, temel_p
     }
 
 
-def analyze_intraday(t, d, p, daily_atr, live_price=None, price_source="Piyasa Verisi"):
+def _format_update_time(ts, override_time=None):
+    if override_time:
+        return override_time
+    try:
+        if ts is not None and (ts.hour != 0 or ts.minute != 0):
+            return ts.strftime("%d.%m %H:%M")
+        elif ts is not None:
+            return ts.strftime("%d.%m.20%y (Gün Sonu)")
+    except Exception:
+        pass
+    return pd.Timestamp.now(TZ).strftime("%H:%M")
+
+
+def analyze_intraday(t, d, p, daily_atr, live_price=None, price_source="Piyasa Verisi", updated_at=None):
     is_live = live_price is not None and live_price > 0
     if is_live:
         d = apply_live_price_to_df(d, live_price)
@@ -680,11 +694,11 @@ def analyze_intraday(t, d, p, daily_atr, live_price=None, price_source="Piyasa V
         "Puan": puan, "Toplam": toplam, "Tek": tek,
         "Stop": plan["stop"], "Risk": plan["risk"], "Hedef1": plan["target1"], "Hedef2": plan["target2"],
         "Lot": plan["lot"], "IsWide": plan["is_wide"], "PlanNote": plan["plan_note"],
-        "IsLive": is_live, "PriceSource": price_source, "_ts": d.index[-1], "RVOL": rvol
+        "IsLive": is_live, "PriceSource": price_source, "UpdatedAt": _format_update_time(d.index[-1], updated_at), "_ts": d.index[-1], "RVOL": rvol
     }
 
 
-def analyze_swing(t, d, p, daily_atr, temel_puan=None, live_price=None, price_source="Piyasa Verisi"):
+def analyze_swing(t, d, p, daily_atr, temel_puan=None, live_price=None, price_source="Piyasa Verisi", updated_at=None):
     if len(d) < 55:
         return None
     is_live = live_price is not None and live_price > 0
@@ -726,7 +740,7 @@ def analyze_swing(t, d, p, daily_atr, temel_puan=None, live_price=None, price_so
         "Puan": puan, "Toplam": toplam, "Tek": tek,
         "Stop": plan["stop"], "Risk": plan["risk"], "Hedef1": plan["target1"], "Hedef2": plan["target2"],
         "Lot": plan["lot"], "IsWide": plan["is_wide"], "PlanNote": plan["plan_note"],
-        "IsLive": is_live, "PriceSource": price_source, "_ts": d.index[-1], "RVOL": rvol
+        "IsLive": is_live, "PriceSource": price_source, "UpdatedAt": _format_update_time(d.index[-1], updated_at), "_ts": d.index[-1], "RVOL": rvol
     }
 
 
@@ -834,14 +848,18 @@ def build_plain_reason(r, is_swing):
 def _cb_apply_live(ticker, inp_key):
     val = float(st.session_state.get(inp_key, 0.0))
     live_dict = st.session_state.setdefault("live_prices", {})
+    live_times = st.session_state.setdefault("live_times", {})
     if val > 0:
         live_dict[ticker] = val
+        live_times[ticker] = pd.Timestamp.now(TZ).strftime("%H:%M")
     else:
         live_dict.pop(ticker, None)
+        live_times.pop(ticker, None)
 
 
 def _cb_clear_live(ticker, inp_key):
     st.session_state.setdefault("live_prices", {}).pop(ticker, None)
+    st.session_state.setdefault("live_times", {}).pop(ticker, None)
     st.session_state[inp_key] = 0.0
 
 
@@ -856,11 +874,16 @@ def card(r, info, frows, mode_name, key_prefix="opp"):
     sector = info.get("sector") or info.get("industry") or ("Gün İçi Fırsat" if not is_swing else "Orta Vadeli Trend")
     is_live = r.get("IsLive", False)
     card_cls = "card-live" if is_live else "card"
-    live_tag = '<span class="live-badge">⚡ MANUEL ANLIK FİYAT</span>' if is_live else f'<span class="src-badge">📡 {r.get("PriceSource", "Piyasa Verisi")}</span>'
+    upd_str = r.get("UpdatedAt") or pd.Timestamp.now(TZ).strftime("%H:%M")
+    live_tag = (
+        f'<span class="live-badge">⚡ MANUEL FİYAT • {upd_str}</span>'
+        if is_live
+        else f'<span class="src-badge">📡 {r.get("PriceSource", "Piyasa Verisi")} • 🕒 {upd_str}</span>'
+    )
     price_label = "Manuel Girilen Fiyat" if is_live else f"Fiyat ({r.get('PriceSource', 'Piyasa')})"
 
     html = (f'<div class="{card_cls}"><div class="top"><div><div class="tk">{r["Hisse"]}{live_tag}</div>'
-            f'<div class="sub">{sector} • {price_label}: <b>{tl(r["Fiyat"])} TL</b> (%{r["Değişim"]:+.1f})</div></div>'
+            f'<div class="sub">{sector} • {price_label}: <b>{tl(r["Fiyat"])} TL</b> (%{r["Değişim"]:+.1f}) • Güncelleme: <b>{upd_str}</b></div></div>'
             f'<div class="pill" style="background:{col}">{label} • {r["Genel"]:.0f}/100</div></div>'
             f'<div class="summary-box">{build_plain_reason(r, is_swing)}<br><small style="opacity:.8">📐 <b>Plan Mantığı:</b> {r["PlanNote"]}</small></div>')
 
@@ -1090,17 +1113,18 @@ with tab1:
             if d1d_c.empty or len(d1d_c) < 55:
                 st.error(f"❌ '{active_ct}' kodu için yeterli BIST verisi bulunamadı.")
             else:
-                tv_snap_c = get_tv_realtime_snapshot((t_clean,)) if not effective_live else {}
+                tv_snap_c, tv_time_c = get_tv_realtime_snapshot((t_clean,)) if not effective_live else ({}, None)
                 auto_live_c = effective_live or tv_snap_c.get(t_clean)
                 src_label_c = "TradingView Canlı" if (not effective_live and tv_snap_c.get(t_clean)) else ("TradingView" if HAS_TV_FEED else "İş Yatırım / Piyasa")
+                upd_time_c = st.session_state.get("live_times", {}).get(t_clean) if effective_live else (tv_time_c if tv_snap_c.get(t_clean) else None)
 
                 daily_atr_c = float(atr(d1d_c).iloc[-1])
                 sc_c, _, frows_c = fund_score(info_c)
                 fp_c, _, _, _ = flow(d1d_c)
                 if "Gün İçi" in mode and not d15_c.empty:
-                    item_c = analyze_intraday(t_clean, d15_c, params, daily_atr_c, live_price=auto_live_c, price_source=src_label_c)
+                    item_c = analyze_intraday(t_clean, d15_c, params, daily_atr_c, live_price=auto_live_c, price_source=src_label_c, updated_at=upd_time_c)
                 else:
-                    item_c = analyze_swing(t_clean, d1d_c, params, daily_atr_c, temel_puan=sc_c, live_price=auto_live_c, price_source=src_label_c)
+                    item_c = analyze_swing(t_clean, d1d_c, params, daily_atr_c, temel_puan=sc_c, live_price=auto_live_c, price_source=src_label_c, updated_at=upd_time_c)
 
                 if item_c:
                     if not effective_live:
@@ -1122,8 +1146,9 @@ with tab1:
         drow = dtab.set_index("Hisse")
         # En likit ilk 20 adaya odaklanarak bekleme süresini minimumda tut
         candidate_tickers = dtab[dtab["Geçti"]].sort_values("İşlem (M TL)", ascending=False)["Hisse"].tolist()[:20]
-        tv_snaps = get_tv_realtime_snapshot(tuple(candidate_tickers))
+        tv_snaps, tv_snap_time = get_tv_realtime_snapshot(tuple(candidate_tickers))
         default_src = "TradingView Canlı" if (HAS_TV_FEED or tv_snaps) else "Piyasa Verisi"
+        live_times = st.session_state.get("live_times", {})
 
         res = []
         if "Gün İçi" in mode:
@@ -1132,7 +1157,8 @@ with tab1:
                 manual_lp = live_prices.get(t)
                 auto_lp = manual_lp or tv_snaps.get(t)
                 src_lbl = "TradingView Canlı" if (not manual_lp and tv_snaps.get(t)) else default_src
-                item = analyze_intraday(t, d, params, float(drow.loc[t, "DailyATR"]), live_price=auto_lp, price_source=src_lbl)
+                upd_lbl = live_times.get(t) if manual_lp else (tv_snap_time if tv_snaps.get(t) else None)
+                item = analyze_intraday(t, d, params, float(drow.loc[t, "DailyATR"]), live_price=auto_lp, price_source=src_lbl, updated_at=upd_lbl)
                 if item:
                     if not manual_lp:
                         item["IsLive"] = False
@@ -1144,8 +1170,9 @@ with tab1:
                     manual_lp = live_prices.get(t)
                     auto_lp = manual_lp or tv_snaps.get(t)
                     src_lbl = "TradingView Canlı" if (not manual_lp and tv_snaps.get(t)) else default_src
+                    upd_lbl = live_times.get(t) if manual_lp else (tv_snap_time if tv_snaps.get(t) else None)
                     sc_t = fs[t][0]
-                    item = analyze_swing(t, d, params, float(drow.loc[t, "DailyATR"]), temel_puan=sc_t, live_price=auto_lp, price_source=src_lbl)
+                    item = analyze_swing(t, d, params, float(drow.loc[t, "DailyATR"]), temel_puan=sc_t, live_price=auto_lp, price_source=src_lbl, updated_at=upd_lbl)
                     if item:
                         if not manual_lp:
                             item["IsLive"] = False
